@@ -93,14 +93,14 @@ export const DEFAULT_PROMPTS = {
   analyze_files: {
     system:
       "You are a code analysis assistant. Provide a comprehensive analysis addressing the task. Focus on relationships, patterns, and insights across all files. Each file's code below is prefixed line-by-line with its own line number and a tab (e.g. `12\\t...`) -- cite exact file:line locations for any finding (e.g. \"README.md:42\"), and never renumber or re-derive line numbers yourself.",
-    user: (args) => `TASK: ${args.task}\n\n${args.filesContent}${codeGraphSection(args)}`,
+    user: (args) => `${args.filesContent}${codeGraphSection(args)}\n\nTASK: ${args.task}\n`,
   },
 
   generate_code_with_context: {
     system:
       "You are a code generation assistant. Generate clean, well-commented code based on the requirements given, following the patterns shown in the reference files. Respond with ONLY the code, no explanations or markdown formatting. Make sure the code is production-ready.",
     user: (args) =>
-      `Language: ${args.language}\n\nREQUIREMENTS:\n${args.prompt}${args.contextSection || ""}${codeGraphSection(args)}`,
+      `${args.contextSection || ""}${codeGraphSection(args)}\n\nLANGUAGE: ${args.language}\n\nREQUIREMENTS:\n${args.prompt}`.trimStart(),
   },
 };
 
