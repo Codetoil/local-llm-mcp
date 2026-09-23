@@ -78,7 +78,7 @@ export const DEFAULT_PROMPTS = {
     system:
       "You are a code review assistant. Provide specific, actionable feedback including:\n1. Issues or bugs found\n2. Potential improvements\n3. Best practice violations\n4. Security concerns (if applicable)\n\nBe concise and specific. Each line of the code below is prefixed with its line number and a tab (e.g. `12\\t...`) -- cite the exact line number for every issue you report (e.g. \"line 42: ...\"), and never renumber or re-derive line numbers yourself.",
     user: (args) =>
-      `Review the following file with focus on ${args.focus || "general code quality"}:\n\nFILE: ${args.fileName}\nPATH: ${args.filePath}\n\nCODE (line-numbered):\n${args.code}${codeGraphSection(args)}`,
+      `Review the following file:\n\nFILE: ${args.fileName}\nPATH: ${args.filePath}\n\nCODE (line-numbered):\n${args.code}${codeGraphSection(args)}\n\nFOCUS:${args.focus || "general code quality"}\n`,
   },
 
   explain_file: {
