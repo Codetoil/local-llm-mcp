@@ -18,6 +18,28 @@ import packageJson from "./package.json" with { type: "json" };
 const execFileAsync = promisify(execFile);
 
 const LOCAL_LLM_BASE_URL = process.env.LOCAL_LLM_BASE_URL || "http://localhost:8080";
+// Optional unix-domain-socket transport. When set, every backend call goes over this
+// socket instead of a TCP address -- for hosts that can see the filesystem but not the
+// network the model server listens on (sandboxed MCP launchers, netns-isolated
+// containers). Front a TCP backend with, e.g.:
+//   socat UNIX-LISTEN:/path/to/llama.sock,fork,mode=600 TCP:127.0.0.1:8081
+// LOCAL_LLM_BASE_URL is then display-only; Node ignores the host part of a URL when
+// socketPath is set.
+const LOCAL_LLM_SOCKET_PATH = process.env.LOCAL_LLM_SOCKET_PATH || null;
+
+// Single client for every backend call, so the transport choice lives in one place and
+// call sites issue relative paths in both modes.
+const api = axios.create(
+  LOCAL_LLM_SOCKET_PATH
+    ? { socketPath: LOCAL_LLM_SOCKET_PATH, baseURL: "http://localhost" }
+    : { baseURL: LOCAL_LLM_BASE_URL }
+);
+
+// A missing socket file is the socket-mode equivalent of a refused connection: both mean
+// "nothing is listening", and both should produce the actionable message rather than a
+// raw errno.
+const isConnectionError = (error) =>
+  error.code === "ECONNREFUSED" || (LOCAL_LLM_SOCKET_PATH !== null && error.code === "ENOENT");
 // Defensive ceiling on generated tokens per call. With a reasoning model and no cap, a
 // single tool call can spend an unbounded number of hidden <think> tokens before ever
 // producing a visible answer -- this bounds worst-case latency without being tight enough
@@ -469,7 +491,8 @@ class LocalLlmServer {
   }
 
   connectionErrorMessage() {
-    return `Cannot connect to local LLM server. Make sure it's running and OpenAI-compatible (llama-server, vLLM, LM Studio, etc.) at ${LOCAL_LLM_BASE_URL}.`;
+    const target = LOCAL_LLM_SOCKET_PATH ? `unix socket ${LOCAL_LLM_SOCKET_PATH}` : LOCAL_LLM_BASE_URL;
+    return `Cannot connect to local LLM server. Make sure it's running and OpenAI-compatible (llama-server, vLLM, LM Studio, etc.) at ${target}.`;
   }
 
   async fetchAvailableModels() {
@@ -479,7 +502,7 @@ class LocalLlmServer {
     }
 
     try {
-      const response = await axios.get(`${LOCAL_LLM_BASE_URL}/v1/models`, {
+      const response = await api.get("/v1/models", {
         timeout: 5000,
       });
       const models = response.data?.data ?? [];
@@ -492,7 +515,7 @@ class LocalLlmServer {
       return models;
     } catch (error) {
       this.modelsCache = null;
-      if (error.code === "ECONNREFUSED") {
+      if (isConnectionError(error)) {
         throw new Error(this.connectionErrorMessage(), { cause: error });
       }
       throw new Error(`Failed to discover model from local LLM server: ${error.message}`, { cause: error });
@@ -539,7 +562,7 @@ class LocalLlmServer {
     }
 
     try {
-      const response = await axios.post(`${LOCAL_LLM_BASE_URL}/v1/chat/completions`, body, {
+      const response = await api.post("/v1/chat/completions", body, {
         timeout: 900000, // 15 minute timeout (overly long, to account for slow local models)
       });
 
@@ -550,7 +573,7 @@ class LocalLlmServer {
       }
       return choice.message.content;
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
+      if (isConnectionError(error)) {
         throw new Error(this.connectionErrorMessage(), { cause: error });
       }
       throw new Error(`local LLM error: ${error.message}`, { cause: error });
@@ -588,8 +611,8 @@ class LocalLlmServer {
   async tokenize(args) {
     const { text, include_tokens } = args;
     try {
-      const response = await axios.post(
-        `${LOCAL_LLM_BASE_URL}/tokenize`,
+      const response = await api.post(
+        "/tokenize",
         { content: text },
         { timeout: 10000 }
       );
@@ -598,7 +621,7 @@ class LocalLlmServer {
       if (include_tokens) info.tokens = tokens;
       return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
+      if (isConnectionError(error)) {
         throw new Error(this.connectionErrorMessage(), { cause: error });
       }
       throw new Error(`Failed to tokenize text: ${error.message}`, { cause: error });
@@ -610,8 +633,8 @@ class LocalLlmServer {
     const resolved = await this.resolveModel(explicitModel, "semantic_similarity");
 
     try {
-      const response = await axios.post(
-        `${LOCAL_LLM_BASE_URL}/v1/embeddings`,
+      const response = await api.post(
+        "/v1/embeddings",
         { model: resolved.id, input: [query, ...candidates] },
         { timeout: 60000 }
       );
@@ -628,7 +651,7 @@ class LocalLlmServer {
 
       return { content: [{ type: "text", text: JSON.stringify({ results }, null, 2) }] };
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
+      if (isConnectionError(error)) {
         throw new Error(this.connectionErrorMessage(), { cause: error });
       }
       throw new Error(`Failed to compute semantic similarity: ${error.message}`, { cause: error });
@@ -766,9 +789,9 @@ class LocalLlmServer {
   async serverInfo() {
     let modelsResponse;
     try {
-      modelsResponse = await axios.get(`${LOCAL_LLM_BASE_URL}/v1/models`, { timeout: 5000 });
+      modelsResponse = await api.get("/v1/models", { timeout: 5000 });
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
+      if (isConnectionError(error)) {
         throw new Error(this.connectionErrorMessage(), { cause: error });
       }
       throw new Error(`Failed to fetch local LLM server info: ${error.message}`, { cause: error });
@@ -779,7 +802,7 @@ class LocalLlmServer {
     // vLLM, LM Studio, etc. that don't have it.
     let props = null;
     try {
-      props = (await axios.get(`${LOCAL_LLM_BASE_URL}/props`, { timeout: 5000 })).data;
+      props = (await api.get("/props", { timeout: 5000 })).data;
     } catch {
       // no-op: props stays null, matching a backend that doesn't implement /props
     }
@@ -787,6 +810,7 @@ class LocalLlmServer {
     const model = modelsResponse.data?.data?.[0];
     const info = {
       base_url: LOCAL_LLM_BASE_URL,
+      socket_path: LOCAL_LLM_SOCKET_PATH,
       model_id: model?.id ?? null,
       model_family: model?.id ? resolveFamily(model.id) : null,
       context_size: props?.default_generation_settings?.n_ctx ?? props?.n_ctx ?? null,
