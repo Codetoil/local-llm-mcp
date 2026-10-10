@@ -173,7 +173,8 @@ export const TOOL_MODEL_PREFERENCES = {};
 // speed per tool. Empty by default -- omitted entirely means "whatever the model/template
 // does by default," unchanged from before this existed. Not a standard OpenAI field; it's
 // a Qwen3-family chat-template convention specifically, and the local LLM server should
-// silently ignore it for templates that don't recognize it. Populate your own, e.g.
+// silently ignore it for templates that don't recognize it. With Ollama it's sent as Ollama's
+// own `think` flag instead, which works for any Ollama thinking model. Populate your own, e.g.
 // { generate_code: false, fix_code: true } to skip thinking on quick generation but keep
 // it for harder debugging.
 export const TOOL_REASONING_OVERRIDES = {};

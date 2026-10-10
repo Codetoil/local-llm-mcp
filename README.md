@@ -1,17 +1,17 @@
 # local-llm-mcp
 
-This MCP (Model Context Protocol) server bridges a local **OpenAI-compatible LLM
-server** — llama.cpp's `llama-server`, vLLM, LM Studio, or anything else that speaks the
-`/v1/chat/completions` API — to **any MCP-speaking coding agent** — Claude Code, Cursor,
+This MCP (Model Context Protocol) server bridges a local LLM server — **Ollama** (through its
+native API), or any **OpenAI-compatible** server such as llama.cpp's `llama-server`, vLLM, LM
+Studio, or anything else that speaks the `/v1/chat/completions` API — to **any MCP-speaking coding agent** — Claude Code, Cursor,
 Codex CLI, Cline, Windsurf, or your own MCP client — letting you delegate coding tasks to
 your local models to minimize cloud API token usage. It speaks standard MCP over stdio, so
 nothing here is Claude-specific; the setup instructions below use Claude Code as the
 reference example since that's what's included (`claude-mcp-config.json`), but the same
 `node index.js` command works as the MCP server entry for any client.
 
-`llama-server` is used as the worked example throughout this README since it's the only
-backend this project's test suite runs against — see "Using a Different Backend" below for
-pointing this server at vLLM, LM Studio, or anything else OpenAI-compatible instead.
+`llama-server` is used as the worked example throughout this README. See "Using Ollama"
+below for Ollama, and "Using a Different Backend" for vLLM, LM Studio, or anything else
+OpenAI-compatible. The test suite runs against mocked llama-server and Ollama backends.
 
 ## How It Works
 
@@ -57,7 +57,11 @@ These tools read files directly on the MCP server, dramatically reducing convers
     context size, slot count, and whether it has a chat template — useful for any agent to
     check what's actually running before assuming a model or capability. The context-size/
     slot/chat-template fields come from llama-server's `/props` extension and come back
-    `null` on backends that don't implement it (see "Using a Different Backend" below).
+    `null` on backends that don't implement it (see "Using a Different Backend" below). With
+    Ollama it reports the model chat tools would use, whether it's loaded, the largest
+    context window it supports (`max_context_size`, from `/api/show`), and the window it's
+    actually running at (`context_size`, from `/api/ps`; `null` until the model is loaded).
+    See "Using Ollama" below.
 13. **local_llm_session_stats** - Reports cumulative prompt/completion/total token usage sent
     to and received from your backend so far in this session, with a per-tool breakdown —
     based on the `usage` field the backend returns per request. Answers "how many tokens
@@ -68,7 +72,7 @@ These tools read files directly on the MCP server, dramatically reducing convers
 14. **local_llm_tokenize** - Counts how many tokens a piece of text would consume according to
     the currently loaded tokenizer, via `/tokenize` — a llama.cpp/llama-server extension, not
     a standard OpenAI endpoint. Useful for checking context-window fit before sending large
-    content.
+    content. Not available with Ollama, which has no tokenize endpoint.
 15. **local_llm_semantic_similarity** - Ranks candidate texts by semantic similarity to a query
     using the backend's `/v1/embeddings` endpoint (standard OpenAI surface, but requires an
     embeddings-capable model to be loaded — for llama-server, start it with `--embeddings`).
@@ -137,6 +141,50 @@ By default this MCP server talks to `http://localhost:8080`. Override with the
 ```bash
 export LOCAL_LLM_BASE_URL=http://localhost:8081
 ```
+
+### Using Ollama
+
+Point `LOCAL_LLM_BASE_URL` at Ollama (default port 11434):
+
+```bash
+export LOCAL_LLM_BASE_URL=http://localhost:11434
+```
+
+The server detects Ollama on the first call by probing `GET /api/version`, which
+OpenAI-compatible servers don't have. Set `LOCAL_LLM_BACKEND=ollama` or
+`LOCAL_LLM_BACKEND=openai` to skip the probe and force either path. With Ollama:
+
+- **Chat goes through the native `POST /api/chat`**, not Ollama's `/v1` compatibility layer,
+  because only the native API lets each request set its context window. Ollama otherwise
+  runs a model at its own default window and **silently drops whatever part of the prompt
+  doesn't fit**, which is exactly the file contents the file-aware tools send.
+- **`LOCAL_LLM_MIN_CTX`** (default `32768`) is the *minimum* window. If your Ollama already
+  runs models with a larger window, for example via `OLLAMA_CONTEXT_LENGTH=131072`, that
+  window is kept. Only a smaller window (Ollama's stock default, or one another client
+  loaded the model with) is raised to the minimum, capped at the model's own maximum. To
+  avoid reloads, every call sends the model's current window back as `num_ctx`: Ollama
+  reloads a model whenever a request's `num_ctx` differs from its running window, and a
+  request *without* `num_ctx` means "the default", which reloads it too. A model that isn't
+  loaded yet is first loaded with an empty request, at your Ollama default, so its window
+  can be read from `/api/ps`. Set `LOCAL_LLM_MIN_CTX=0` to never send `num_ctx` at all.
+- **If a prompt still didn't fit**, the tool's answer gets an appended
+  `[WARNING: the input didn't fit the model's N-token context window ...]` note. Ollama
+  doesn't report truncation itself, so this is inferred from how few prompt tokens it
+  evaluated compared to the size of the input. N is the window the model actually ran at,
+  read back from `/api/ps`. If that's already the model's maximum, the warning says to send
+  less rather than to raise `LOCAL_LLM_MIN_CTX`.
+  `local_llm_server_info` shows both numbers for the current model.
+- **Model auto-detection** prefers the model Ollama currently has loaded (`/api/ps`), then
+  falls back to installed models (`/api/tags`), which Ollama loads on demand. Ollama's
+  `/v1/models` isn't used for this because it lists every installed model, loaded or not.
+  Chat tools only pick models with the `completion` capability, and
+  `local_llm_semantic_similarity` only picks ones with `embedding` (e.g.
+  `ollama pull nomic-embed-text`).
+- **`TOOL_REASONING_OVERRIDES`** maps to Ollama's own `think` flag instead of
+  `chat_template_kwargs`, so it works for every Ollama thinking model, not just Qwen3.
+  Ollama returns reasoning separately from the answer, so no extra server flag is needed.
+- **`local_llm_tokenize`** isn't available, since Ollama has no tokenize endpoint; it returns
+  an error that says so.
 
 ### Using a Different Backend (vLLM, LM Studio, etc.)
 
@@ -264,9 +312,43 @@ Simply ask the agent to do tasks, and it will decide when to delegate to the loc
 
 There's no hardcoded model anymore. Every tool call auto-detects whichever model your
 backend currently has loaded (via `GET /v1/models`, standard across OpenAI-compatible
-servers, cached for ~30 seconds), so switching models is just a matter of restarting the
+servers, or `/api/ps` and `/api/tags` with Ollama; cached for ~30 seconds), so switching models is just a matter of restarting the
 backend with a different model loaded (e.g. `llama-server`'s `-m` flag). You can still
 force a specific model per call by passing an explicit `model` argument to any tool.
+
+**Pinning a model.** Set `LOCAL_LLM_CHAT_MODEL` to the model the 14 chat tools should use,
+and `LOCAL_LLM_EMBEDDING_MODEL` to the one for `local_llm_semantic_similarity`. Either one
+replaces auto-detection entirely for its tools, so the choice no longer depends on what
+happens to be loaded or most recently pulled. This matters most with Ollama, where several
+models are typically installed. A per-call `model` argument still wins. An unknown name
+fails with the backend's own message, e.g. `(model 'gemma4:e4b-typo' not found)`.
+
+With Ollama, a configured model that isn't installed yet is **pulled automatically** on
+first use (`POST /api/pull`), so the first call may take as long as the download.
+Concurrent calls share one pull, and a name that can't be pulled fails with Ollama's reason
+(e.g. `pull model manifest: file does not exist`). This only applies to these two settings,
+never to a `model` argument passed by the calling agent, so an agent can't start downloads
+on its own. `LOCAL_LLM_AUTO_PULL=0` turns it off. Set them in the `env` of your MCP client
+config:
+
+```json
+{
+  "mcpServers": {
+    "local_llm": {
+      "command": "npx",
+      "args": ["-y", "github:hlgr360/local-llm-mcp"],
+      "env": {
+        "LOCAL_LLM_BASE_URL": "http://localhost:11434",
+        "LOCAL_LLM_CHAT_MODEL": "gemma4:e4b-mlx",
+        "LOCAL_LLM_EMBEDDING_MODEL": "nomic-embed-text"
+      }
+    }
+  }
+}
+```
+
+Order of precedence: per-call `model` argument, then `LOCAL_LLM_CHAT_MODEL` /
+`LOCAL_LLM_EMBEDDING_MODEL`, then `TOOL_MODEL_PREFERENCES` (below), then auto-detection.
 
 **Router/multi-model setups** (e.g. `llama-swap` fronting several models): when
 `/v1/models` reports more than one entry, auto-detection consults `TOOL_MODEL_PREFERENCES`
@@ -373,8 +455,10 @@ Add new tools by:
 
 ### "Cannot connect to local LLM server" Error
 - Ensure your backend is running, e.g. `llama-server -m <model.gguf> --jinja --port 8080`
+  or `ollama serve`
 - Check it's on the expected port: `curl http://localhost:8080/health` (or your backend's
-  equivalent health/models endpoint)
+  equivalent health/models endpoint, e.g. `curl http://localhost:11434/api/version` for
+  Ollama)
 - Confirm `LOCAL_LLM_BASE_URL` (if set) matches where your backend is actually listening
 
 ### Tools Not Appearing in Your MCP Client
@@ -445,10 +529,12 @@ Response time depends on:
 local-llm-mcp/
 ├── index.js              # Main MCP server implementation
 ├── prompts.js            # Prompt registry, indexed by model family
-├── test/                 # Automated test suite (npm test) — mocked llama-server backend
+├── test/                 # Automated test suite (npm test) — mocked llama-server and Ollama backends
 │   ├── helpers/mockLlamaServer.js
+│   ├── helpers/mockOllamaServer.js
 │   ├── prompts.test.js
 │   ├── server.test.js
+│   ├── ollama.test.js
 │   ├── server-unreachable.test.js
 │   └── integration.test.js
 ├── scripts/

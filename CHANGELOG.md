@@ -1,8 +1,60 @@
 # Changelog
 
-## Unreleased - Attribution
+## Version 3.2.0 - Ollama backend
+
+### Features
+- **Ollama support through its native API.** The server probes `GET /api/version` once
+  (cached) and, if Ollama answers, sends chat through `POST /api/chat` instead of
+  `/v1/chat/completions`. `LOCAL_LLM_BACKEND=ollama|openai` skips the probe. The native API is
+  the only way to set a per-request context window: verified against Ollama 0.40.2, a prompt
+  larger than the window is cut down without any error (a 1024-token window kept 514 tokens of
+  a ~5k-token prompt). `MAX_TOKENS` is sent as `num_predict`.
+- **`LOCAL_LLM_MIN_CTX`** (default `32768`, `0` = never send `num_ctx`) is a minimum context
+  window, capped at the model's maximum: a larger window configured on the Ollama side (e.g.
+  `OLLAMA_CONTEXT_LENGTH=131072`) is kept rather than shrunk. Every call sends the model's
+  current window back as `num_ctx`, because Ollama reloads a model on any `num_ctx` change,
+  and also when `num_ctx` is omitted and the model was loaded with a non-default window (both
+  verified on 0.40.2). An unloaded model is first loaded with an empty `messages: []`
+  request, which loads it at the server default without generating, so its window can be read.
+- **Truncated-input warning (Ollama).** Since Ollama doesn't report dropped prompt tokens, a
+  response whose input came out at more than 8 characters per evaluated prompt token gets an
+  appended `[WARNING: the input didn't fit the model's N-token context window ...]` note. N is
+  the window the model ran at; when that's already the model's maximum, the advice is to send
+  less rather than to raise `LOCAL_LLM_MIN_CTX`.
+- **Ollama model detection.** Prefers the loaded model (`/api/ps`), then installed models
+  (`/api/tags`), rather than Ollama's `/v1/models`, which lists every installed model.
+  `resolveModel` now filters by reported capabilities: chat tools only pick `completion`
+  models, `local_llm_semantic_similarity` only `embedding` models, with an install hint when
+  there is none. Backends that don't report capabilities are unaffected.
+- **`LOCAL_LLM_CHAT_MODEL` / `LOCAL_LLM_EMBEDDING_MODEL`** pin the model for chat tools and
+  for `local_llm_semantic_similarity`, on any backend. They replace auto-detection for their
+  tools; a per-call `model` argument still wins. With several Ollama models installed,
+  auto-detection otherwise depends on what's loaded or most recently pulled.
+- **Auto-pull of configured models (Ollama).** A `LOCAL_LLM_CHAT_MODEL` /
+  `LOCAL_LLM_EMBEDDING_MODEL` that isn't installed is pulled via `/api/pull` on first use
+  (1-hour timeout, concurrent calls share one pull, untagged names match `:latest`). Never for
+  a per-call `model` argument, so the calling agent can't trigger downloads.
+  `LOCAL_LLM_AUTO_PULL=0` disables it.
+- Chat request errors now include the backend's own explanation from the response body, e.g.
+  `Request failed with status code 404 (model 'x' not found)`.
+- `TOOL_REASONING_OVERRIDES` is sent as Ollama's `think` flag with Ollama.
+- `local_llm_server_info` with Ollama reports `ollama_version`, the model chat tools would use,
+  `model_loaded`, the running `context_size` (`/api/ps`), the model's `max_context_size`
+  (`/api/show`, known even before it's loaded), and `min_context_size`. Both backends now
+  include a `backend` field.
+- `local_llm_tokenize` with Ollama returns an explicit "not supported" error instead of a 404.
+
+### Tests
+- `test/ollama.test.js` with `test/helpers/mockOllamaServer.js` (shaped after real Ollama
+  0.40.2 responses): detection and override, model selection by load state and capability,
+  native request shape (`num_ctx`, `num_predict`, `think`), context-window selection (keeping
+  a larger default, raising a smaller one, no reloads, capped at the model's maximum), both
+  truncation warnings, token
+  usage mapping, server info, tokenize, embeddings. Also verified by hand against a real
+  Ollama 0.40.2 with `llama3.2`.
 
 ### Documentation
+- New "Using Ollama" README section; AGENTS.md architecture notes updated.
 - Credit the original project: this repository is a fork of
   [Jadael/OllamaClaude](https://github.com/Jadael/OllamaClaude) (AGPL-3.0). Added a `NOTICE` file
   with the attribution and the modification notice (what and since when), an "Origin and licence"

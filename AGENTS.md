@@ -5,18 +5,18 @@ repo. For user-facing docs see `README.md`; for manual validation see `TEST.md`.
 
 ## What this is
 
-A Node.js MCP server (`index.js`) that bridges a local OpenAI-compatible LLM server —
-`llama-server` (llama.cpp), vLLM, LM Studio, etc. — to MCP-speaking coding agents, exposing
-15 `local_llm_*` tools. `llama-server` is the primary worked example and the only backend
-this project's own test suite runs against (see README's "Using a Different Backend"
-section for pointing at something else). `prompts.js` holds the system/user prompt
+A Node.js MCP server (`index.js`) that bridges a local LLM server — Ollama (native API), or
+an OpenAI-compatible one such as `llama-server` (llama.cpp), vLLM, LM Studio — to
+MCP-speaking coding agents, exposing 15 `local_llm_*` tools. `llama-server` is the primary
+worked example; the test suite mocks both llama-server and Ollama (see README's "Using
+Ollama" and "Using a Different Backend" sections). `prompts.js` holds the system/user prompt
 templates, indexed by tool and by detected model family.
 
 ## Commands
 
 ```bash
 npm install     # install deps (@modelcontextprotocol/sdk, axios) + devDeps (eslint)
-npm test        # run the automated suite (node --test) — mocked backend, ~250ms, no llama-server needed
+npm test        # run the automated suite (node --test) — mocked backends, ~1.5s, no real server needed
 npm run lint    # ESLint (flat config, recommended rules only — no style/formatting rules)
 npm start        # run the MCP server on stdio (needs a real llama-server on LOCAL_LLM_BASE_URL)
 node --check index.js && node --check prompts.js   # quick syntax check
@@ -24,7 +24,8 @@ node --check index.js && node --check prompts.js   # quick syntax check
 
 Running against a **real** `llama-server` requires it to already be up (default
 `http://localhost:8080`, override via `LOCAL_LLM_BASE_URL`). `npm test` does not need this —
-`test/helpers/mockLlamaServer.js` stands in for it.
+`test/helpers/mockLlamaServer.js` stands in for it (and `test/helpers/mockOllamaServer.js`
+for Ollama).
 
 ## Architecture, in one pass
 
@@ -45,10 +46,27 @@ Running against a **real** `llama-server` requires it to already be up (default
   single call can spend an unbounded number of hidden `<think>` tokens before answering.
   `finish_reason === "length"` appends a truncation warning rather than silently returning
   a cut-off answer. `TOOL_REASONING_OVERRIDES[toolName]` (in `prompts.js`, empty by default)
-  optionally sets `chat_template_kwargs: { enable_thinking }` per tool — confirmed ~50x
+  optionally sets `chat_template_kwargs: { enable_thinking }` (Ollama: `think`) per tool — confirmed ~50x
   faster (28s → 541ms) for a trivial `generate_code` call with thinking disabled. Not a
   standard OpenAI field; it's Qwen3-specific and silently ignored by templates that don't
   recognize it.
+  **Two backends.** `detectBackend()` probes `GET /api/version` once per instance (cached;
+  `LOCAL_LLM_BACKEND=ollama|openai` skips it) — Ollama answers, OpenAI-compatible servers
+  404. With Ollama, `callLocalLlm` goes through `ollamaChat` (native `POST /api/chat`) instead
+  of `openAiChat` (`/v1/chat/completions`), because only the native API takes a per-request
+  `num_ctx` — without it Ollama silently drops prompt that doesn't fit its default window.
+  `ollamaContextWindow` picks it: the model's current window, raised to `LOCAL_LLM_MIN_CTX`
+  (default 32768, capped at the model's max) if smaller. Always send it explicitly — Ollama
+  reloads on any `num_ctx` change, and *omitting* it means "default", which also reloads a
+  model loaded with another window. Unloaded models get an empty `messages: []` request
+  first (loads at the server default without generating) so `/api/ps` can report it. Ollama never reports that truncation, so `ollamaChat`
+  infers it (characters per evaluated prompt token > 8) and `callLocalLlm` appends a warning.
+  Models come from `/api/ps` (loaded first) + `/api/tags`, carrying `capabilities`;
+  `resolveModel` keeps chat tools on `completion` models and `semantic_similarity` on
+  `embedding` ones. `tokenize` errors out on Ollama (no endpoint); `serverInfo` has its own
+  `ollamaServerInfo`. Context windows: `ollamaMaxContext` (`/api/show`, the model's maximum,
+  known unloaded) and `ollamaRunningContext` (`/api/ps`, the actual window — Ollama caps
+  `num_ctx` at the maximum), both best-effort/null on failure.
   `getCodeGraphContext(query, cwd)` is a best-effort helper the four file-aware tools call:
   if `cwd` (default `process.cwd()`) has a `.codegraph/` directory, it shells out to
   `codegraph explore <query>` (binary overridable via `CODEGRAPH_BIN`, mainly for tests) and
@@ -67,14 +85,17 @@ Running against a **real** `llama-server` requires it to already be up (default
   `DEFAULT_PROMPTS` entry in `prompts.js`, (3) a method on `LocalLlmServer` calling
   `this.callLocalLlm("your_tool_key", args)`, (4) a case in the `CallToolRequestSchema`
   switch. Keep the tool name prefixed `local_llm_`.
-- **No hardcoded models.** Model is always auto-detected via `resolveModel`, with an
-  optional per-call `model` arg override. Don't reintroduce a default/fallback model
-  constant.
+- **No hardcoded models.** Model is auto-detected via `resolveModel`, unless the user names
+  one: per-call `model` arg, then `LOCAL_LLM_CHAT_MODEL` / `LOCAL_LLM_EMBEDDING_MODEL` (user
+  configuration, read per call). Don't reintroduce a default/fallback model constant in code.
+  With Ollama, `ensureOllamaModel` auto-pulls a configured model that isn't installed —
+  keep that limited to the env-configured names; a per-call `model` arg comes from the
+  calling agent and must never trigger a download.
 - **File-aware tools take absolute paths** and read files inside the MCP server process —
   don't ask the orchestrating agent to paste file contents when a `*_file`/`*_files` tool
   variant exists for that purpose.
 - **`callLocalLlm` only reads `message.content`** from the chat-completion response, never
-  `message.reasoning_content`. If you add handling for reasoning output, keep in mind the
+  `message.reasoning_content` (or Ollama's `message.thinking`). If you add handling for reasoning output, keep in mind the
   server needs `--reasoning-format deepseek` for those to even be split apart — see
   README's "Prompt Templates" section.
 - After changing `index.js`/`prompts.js`: run `npm test` and `npm run lint`, and if you
@@ -88,7 +109,7 @@ Running against a **real** `llama-server` requires it to already be up (default
 
 - Single 15-minute request timeout (`callLocalLlm`), intentionally generous for slow local
   hardware — don't "fix" this down without checking `TEST.md`'s timing notes.
-- `LOCAL_LLM_BASE_URL` is read once at module import time as a top-level constant; it can't
+- `LOCAL_LLM_BASE_URL` (and `LOCAL_LLM_MIN_CTX`) is read once at module import time as a top-level constant; it can't
   be changed per-instance at runtime. Tests that need a fresh backend URL do so in their
   own file/process (see `test/server-unreachable.test.js`).
 - `index.js`'s shebang line, its `bin` entry in `package.json`, and the
