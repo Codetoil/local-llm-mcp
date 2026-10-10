@@ -109,6 +109,52 @@ describe("resolveModel with multiple models (router/multi-model support)", () =>
   });
 });
 
+describe("resolveModel with LOCAL_LLM_CHAT_MODEL / LOCAL_LLM_EMBEDDING_MODEL", () => {
+  afterEach(() => {
+    delete process.env.LOCAL_LLM_CHAT_MODEL;
+    delete process.env.LOCAL_LLM_EMBEDDING_MODEL;
+    delete TOOL_MODEL_PREFERENCES.write_tests;
+  });
+
+  test("LOCAL_LLM_CHAT_MODEL wins over the loaded model and preferences, without querying /v1/models", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    mock.state.modelIds = ["deepseek-coder-v2", "qwen2.5-coder"];
+    TOOL_MODEL_PREFERENCES.write_tests = ["qwen"];
+    const server = new LocalLlmServer();
+    const resolved = await server.resolveModel(undefined, "write_tests");
+    assert.deepEqual(resolved, { id: "gemma-3-4b-it", family: "gemma" });
+    assert.equal(mock.state.requests.filter((r) => r.url === "/v1/models").length, 0);
+  });
+
+  test("an explicit model argument still wins over LOCAL_LLM_CHAT_MODEL", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    const server = new LocalLlmServer();
+    const resolved = await server.resolveModel("qwen-explicit", "generate_code");
+    assert.equal(resolved.id, "qwen-explicit");
+  });
+
+  test("LOCAL_LLM_EMBEDDING_MODEL is used for semantic_similarity only", async () => {
+    process.env.LOCAL_LLM_EMBEDDING_MODEL = "nomic-embed-text";
+    const server = new LocalLlmServer();
+    assert.equal((await server.resolveModel(undefined, "semantic_similarity")).id, "nomic-embed-text");
+    assert.equal((await server.resolveModel(undefined, "generate_code")).id, "mock-org/mock-model-7b");
+  });
+
+  test("LOCAL_LLM_CHAT_MODEL isn't used for semantic_similarity", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    const server = new LocalLlmServer();
+    assert.equal((await server.resolveModel(undefined, "semantic_similarity")).id, "mock-org/mock-model-7b");
+  });
+
+  test("the configured chat model is what's actually sent", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "x", language: "python" });
+    const chatRequest = mock.state.requests.find((r) => r.url === "/v1/chat/completions");
+    assert.equal(chatRequest.body.model, "gemma-3-4b-it");
+  });
+});
+
 describe("callLocalLlm / tool methods", () => {
   test("generateCode sends the built messages and returns the model's content", async () => {
     const server = new LocalLlmServer();
