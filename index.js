@@ -69,6 +69,16 @@ const DECISION_QUESTIONS = {
     },
   },
 };
+const GIT_TIMEOUT_MS = 30_000;
+const GIT_MAX_BUFFER = 50 * 1024 * 1024;
+// What review_diff accepts as a ref (branch, tag, HEAD~2, origin/main, a SHA). It can never
+// start with "-", so it can't be read as an option: `git diff --output=<file>` writes files.
+const SAFE_GIT_REF = /^[A-Za-z0-9_./@{}~^][A-Za-z0-9_./@{}~^-]*$/;
+// Always passed to git for review_diff, so a repository's own config can't make it run
+// programs: fsmonitor hooks are switched off, external diff drivers and textconv filters are
+// skipped by the diff flags.
+const GIT_SAFE_CONFIG = ["-c", "core.fsmonitor=false"];
+const GIT_DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv"];
 const GLOB_METACHARACTERS = /[*?[{]/;
 const MAX_GLOB_MATCHES = 50;
 const CODEGRAPH_CONTEXT_CHAR_LIMIT = 4000;
@@ -92,11 +102,54 @@ function isUnreachable(error) {
   return error.code === "ECONNREFUSED" || error.code === "ECONNRESET";
 }
 
-// What a decision model sees of a request: the tool, the calling agent's own instruction text
-// (whichever of these fields the tool has), and how much code comes with it -- never the code
-// itself, which wouldn't fit a decision model's 512-1024-token input anyway.
+// Prefixes every line of a unified diff that exists in the new version of a file (context and
+// added lines) with that line number, read from the hunk headers, and leaves the number blank
+// for removed lines. A small model can then cite real file:line locations without having to
+// work them out from "@@ -a,b +c,d @@" itself, which it does unreliably.
+function annotateDiff(diff) {
+  let newLine = null;
+  return diff
+    .split("\n")
+    .map((line) => {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (hunk) {
+        newLine = Number(hunk[1]);
+        return line;
+      }
+      if (newLine === null || line.startsWith("diff --git ")) {
+        newLine = null;
+        return line;
+      }
+      if (line.startsWith("-")) return `${"".padStart(6)} ${line}`;
+      if (line.startsWith("+") || line.startsWith(" ")) return `${String(newLine++).padStart(6)} ${line}`;
+      return line; // "\ No newline at end of file" and the like
+    })
+    .join("\n");
+}
+
+// One line saying what each tool does, sent to the decision model ahead of the agent's own
+// instruction. Without it, a review called with no focus reaches Laya as an empty request and
+// comes back "low" (measured: review_diff went from low 0.74 to high 0.79 with this line).
+const DECISION_TASKS = {
+  generate_code: "Write new code to these requirements.",
+  generate_code_with_context: "Write new code to these requirements, following the reference files.",
+  explain_code: "Explain what this code does and how it works.",
+  explain_file: "Explain what this code does and how it works.",
+  review_code: "Review this code for bugs, security issues and code quality problems.",
+  review_file: "Review this code for bugs, security issues and code quality problems.",
+  review_diff: "Review these code changes for bugs, regressions and risky changes.",
+  refactor_code: "Refactor this code.",
+  fix_code: "Fix the bug in this code.",
+  write_tests: "Write unit tests for this code.",
+  analyze_files: "Analyze these files together.",
+  digest_file: "Summarize this log or output: find the errors and failures and their likely cause.",
+};
+
+// What a decision model sees of a request: the tool, what it does, the calling agent's own
+// instruction text (whichever of these fields the tool has), and how much code comes with it --
+// never the code itself, which wouldn't fit a decision model's 512-1024-token input anyway.
 function decisionState(toolName, args) {
-  const instruction = [args.prompt, args.task, args.goal, args.error, args.focus, args.context, args.question]
+  const instruction = [DECISION_TASKS[toolName], args.prompt, args.task, args.goal, args.error, args.focus, args.context, args.question]
     .filter((part) => typeof part === "string" && part.trim())
     .join("\n")
     .slice(0, DECISION_REQUEST_CHAR_LIMIT);
@@ -448,6 +501,39 @@ class LocalLlmServer {
           },
         },
         {
+          name: "local_llm_review_diff",
+          description: "Review git changes with your local LLM server. The server runs `git diff` itself (read-only) and reviews the result, so the diff never enters your context. Use it for changes you didn't write or no longer have in view: a branch against main, a checked-out PR, or a long session's uncommitted work before committing. Findings cite file:line in the new version. Untracked files aren't included.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo_path: {
+                type: "string",
+                description: "Absolute path to the git repository (or any directory inside it)",
+              },
+              base: {
+                type: "string",
+                description: "Review what the current branch adds since it left this ref, like a pull request (git diff <base>...HEAD), e.g. \"main\" or \"origin/main\". Omit to review uncommitted changes (staged and unstaged) instead.",
+              },
+              staged: {
+                type: "boolean",
+                description: "Review only staged changes (git diff --cached). Can't be combined with base.",
+                default: false,
+              },
+              paths: {
+                type: "array",
+                items: { type: "string" },
+                description: "Limit the review to these files or directories (relative to the repository)",
+              },
+              focus: {
+                type: "string",
+                description: "What to focus on (e.g., \"security\", \"error handling\"); defaults to bugs, regressions and risky changes",
+              },
+              model: MODEL_ARG_SCHEMA,
+            },
+            required: ["repo_path"],
+          },
+        },
+        {
           name: "local_llm_server_info",
           description: "Report which model the local LLM server currently has loaded, its context size, and its capabilities. Use this to check what's actually running before assuming a model or capability.",
           inputSchema: {
@@ -532,6 +618,8 @@ class LocalLlmServer {
             return await this.analyzeFiles(args);
           case "local_llm_generate_code_with_context":
             return await this.generateCodeWithContext(args);
+          case "local_llm_review_diff":
+            return await this.reviewDiff(args);
           case "local_llm_server_info":
             return await this.serverInfo();
           case "local_llm_session_stats":
@@ -1178,6 +1266,60 @@ class LocalLlmServer {
       prompt,
       language,
       contextSection,
+      codeGraphContext,
+      model,
+    });
+    return { content: [{ type: "text", text: response }] };
+  }
+
+  async reviewDiff(args) {
+    const { repo_path, base, staged, paths = [], focus, model } = args;
+    if (!repo_path || !path.isAbsolute(repo_path)) {
+      throw new Error("repo_path must be an absolute path to a git repository.");
+    }
+    if (base !== undefined && staged) {
+      throw new Error("Use either base or staged, not both.");
+    }
+    if (base !== undefined && !SAFE_GIT_REF.test(base)) {
+      throw new Error(`Not a valid git ref: ${JSON.stringify(base)}. Use a branch, tag or commit such as "main" or "origin/main".`);
+    }
+    if (!Array.isArray(paths) || paths.some((entry) => typeof entry !== "string")) {
+      throw new Error("paths must be an array of strings.");
+    }
+
+    const range = staged ? ["--cached"] : base !== undefined ? [`${base}...HEAD`] : ["HEAD"];
+    const description = staged
+      ? "staged changes"
+      : base !== undefined
+        ? `changes on the current branch since ${base}`
+        : "uncommitted changes (staged and unstaged)";
+    // Paths go after "--", where git treats everything as a path, never as an option.
+    const git = async (extra) => {
+      try {
+        const { stdout } = await execFileAsync(
+          "git",
+          [...GIT_SAFE_CONFIG, "diff", ...GIT_DIFF_FLAGS, ...extra, ...range, "--", ...paths],
+          { cwd: repo_path, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }
+        );
+        return stdout;
+      } catch (error) {
+        const reason = error.stderr?.trim() || error.message;
+        throw new Error(`git diff failed in ${repo_path}: ${reason}`, { cause: error });
+      }
+    };
+
+    const changedFiles = (await git(["--name-only"])).split("\n").filter(Boolean);
+    if (changedFiles.length === 0) {
+      return { content: [{ type: "text", text: `No changes to review: ${description} are empty.` }] };
+    }
+    const diff = await git([]);
+    const codeGraphContext = await getCodeGraphContext(changedFiles.map((file) => path.basename(file)).join(" "), repo_path);
+
+    const response = await this.callLocalLlm("review_diff", {
+      diff: annotateDiff(diff),
+      changedFiles,
+      description,
+      focus,
       codeGraphContext,
       model,
     });

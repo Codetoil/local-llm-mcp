@@ -96,6 +96,13 @@ export const DEFAULT_PROMPTS = {
     user: (args) => `TASK: ${args.task}\n\n${args.filesContent}${codeGraphSection(args)}`,
   },
 
+  review_diff: {
+    system:
+      "You are a code review assistant reviewing a set of changes given as a unified diff. Comment on what the changes introduce: bugs, regressions, risky or incomplete changes, missing error handling, and security concerns. Don't review unchanged code except where a change breaks it. Each line that exists in the new version of a file is prefixed with its line number there; removed lines have no number. Cite the file and that line number for every finding (e.g. \"src/app.js:42: ...\"), and never re-derive line numbers yourself. Be concise and specific; if the changes look correct, say so briefly rather than inventing issues.",
+    user: (args) =>
+      `Review the following ${args.description} with focus on ${args.focus || "bugs, regressions and risky changes"}.\n\nCHANGED FILES:\n${args.changedFiles.join("\n")}\n\nDIFF (new-file line numbers on the left):\n${args.diff}${codeGraphSection(args)}`,
+  },
+
   generate_code_with_context: {
     system:
       "You are a code generation assistant. Generate clean, well-commented code based on the requirements given, following the patterns shown in the reference files. Respond with ONLY the code, no explanations or markdown formatting. Make sure the code is production-ready.",
@@ -104,7 +111,7 @@ export const DEFAULT_PROMPTS = {
   },
 };
 
-// Shared by the four file-aware tools above: folds in CodeGraph-derived context (call
+// Shared by the file-aware tools above: folds in CodeGraph-derived context (call
 // paths, blast radius) when index.js's getCodeGraphContext() found a .codegraph/ index for
 // the project, empty string otherwise.
 function codeGraphSection(args) {
@@ -148,6 +155,10 @@ export const FAMILY_OVERRIDES = {
     explain_file: {
       system:
         "You are a code explanation assistant. Provide a clear, comprehensive explanation of what the file does, how it works, and any important patterns or considerations. Each line of the code below is prefixed with its line number and a tab (e.g. `12\\t...`) -- reference specific line numbers when pointing out a section, rather than describing location vaguely. Write in plain prose paragraphs -- no emoji, no markdown headers, tables, or horizontal rules. Stay grounded in the file given; don't pad the explanation with generic background or unrelated caveats.",
+    },
+    review_diff: {
+      system:
+        "You are a code review assistant reviewing a set of changes given as a unified diff. Comment on what the changes introduce: bugs, regressions, risky or incomplete changes, missing error handling, and security concerns. Don't review unchanged code except where a change breaks it. Each line that exists in the new version of a file is prefixed with its line number there; removed lines have no number. Cite the file and that line number for every finding (e.g. \"src/app.js:42: ...\"), and never re-derive line numbers yourself. Be concise and specific; if the changes look correct, say so briefly rather than inventing issues. Write in plain text -- no emoji, no decorative section headers, no markdown tables. Don't append rewritten versions of the changed files unless the task asks for them.",
     },
     analyze_files: {
       system:

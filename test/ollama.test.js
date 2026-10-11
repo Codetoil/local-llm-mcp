@@ -431,15 +431,22 @@ describe("thinking decisions (Ollama)", () => {
     const server = new LocalLlmServer();
     await server.reviewFile({ file_path: filePath, focus: "concurrency bugs" });
     const { state } = requestsTo("/v1/systemone")[0].body;
-    assert.deepEqual(state, { tool: "review_file", request: "concurrency bugs", code_lines: 300 });
+    assert.deepEqual(state, {
+      tool: "review_file",
+      request: "Review this code for bugs, security issues and code quality problems.\nconcurrency bugs",
+      code_lines: 300,
+    });
   });
 
-  test("a request without instructions says so instead of sending an empty string", async () => {
+  test("without the agent's own instructions, the tool's task still tells the decision model what's asked", async () => {
     const filePath = path.join(tmpDir, "small.js");
     await fs.writeFile(filePath, "export const a = 1;\n");
     const server = new LocalLlmServer();
     await server.reviewFile({ file_path: filePath });
-    assert.equal(requestsTo("/v1/systemone")[0].body.state.request, "(no instructions beyond the tool itself)");
+    assert.equal(
+      requestsTo("/v1/systemone")[0].body.state.request,
+      "Review this code for bugs, security issues and code quality problems."
+    );
   });
 
   test("no decision model installed: no decision, model default", async () => {
