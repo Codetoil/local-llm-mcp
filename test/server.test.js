@@ -371,6 +371,62 @@ describe("callLocalLlm / tool methods", () => {
   });
 });
 
+describe("digestFile", () => {
+  const lastPrompt = () =>
+    mock.state.requests.filter((r) => r.url === "/v1/chat/completions").at(-1).body.messages[1].content;
+
+  test("sends the whole log line-numbered, with the question and file details", async () => {
+    const logPath = path.join(tmpDir, "test.log");
+    await fs.writeFile(logPath, "running 3 tests\nok 1\nnot ok 2 - adds numbers\nok 3\n");
+    const server = new LocalLlmServer();
+    await server.digestFile({ file_path: logPath, question: "which test failed?" });
+    const prompt = lastPrompt();
+    assert.match(prompt, /^QUESTION: which test failed\?/);
+    assert.match(prompt, /FILE: test\.log\nPATH: .*test\.log\nLINES: 5\n/);
+    assert.match(prompt, /^3\tnot ok 2 - adds numbers$/m);
+    assert.doesNotMatch(prompt, /omitted/);
+  });
+
+  test("strips terminal color codes", async () => {
+    const logPath = path.join(tmpDir, "color.log");
+    await fs.writeFile(logPath, "\x1b[31mFAIL\x1b[0m test/a.test.js\n\x1b[2K\x1b[1Gdone\n");
+    const server = new LocalLlmServer();
+    await server.digestFile({ file_path: logPath });
+    const prompt = lastPrompt();
+    assert.match(prompt, /^1\tFAIL test\/a\.test\.js$/m);
+    assert.match(prompt, /^2\tdone$/m);
+    assert.ok(!prompt.includes("\x1b"), "escape codes left in the prompt");
+  });
+
+  test("a log over the budget keeps its start and end, with original line numbers and a marker", async () => {
+    const logPath = path.join(tmpDir, "huge.log");
+    const lines = Array.from({ length: 20000 }, (_, i) => `line ${i + 1}: progress output that nobody needs to read`);
+    lines[0] = "line 1: START of the run";
+    lines[19999] = "line 20000: 1 test FAILED";
+    await fs.writeFile(logPath, lines.join("\n"));
+    const server = new LocalLlmServer();
+    await server.digestFile({ file_path: logPath });
+    const prompt = lastPrompt();
+    assert.ok(prompt.length < 101_000, `prompt is ${prompt.length} chars`);
+    assert.match(prompt, /^1\tline 1: START of the run$/m);
+    assert.match(prompt, /^20000\tline 20000: 1 test FAILED$/m);
+    const marker = /\[\.\.\. lines (\d+)-(\d+) omitted \((\d+) lines\) \.\.\.\]/.exec(prompt);
+    assert.ok(marker, "expected an omitted-lines marker");
+    const [, from, to, count] = marker.map(Number);
+    assert.equal(count, to - from + 1);
+    assert.match(prompt, new RegExp(`^${from - 1}\\t`, "m")); // last head line is right before the gap
+    assert.match(prompt, new RegExp(`^${to + 1}\\t`, "m")); // first tail line is right after it
+    assert.match(prompt, new RegExp(`LINES: 20000 \\(lines ${from}-${to} omitted to fit`));
+    // Most of the budget goes to the end, where failures usually are.
+    assert.ok(20000 - to > from * 3, `head ${from - 1} lines, tail ${20000 - to} lines`);
+  });
+
+  test("a missing file is a clear error", async () => {
+    const server = new LocalLlmServer();
+    await assert.rejects(() => server.digestFile({ file_path: path.join(tmpDir, "nope.log") }), /Failed to read file .*nope\.log/);
+  });
+});
+
 describe("serverInfo", () => {
   test("merges /props and /v1/models into one report", async () => {
     mock.state.modelId = "qwen-2.5-coder-7b";
@@ -413,7 +469,14 @@ describe("sessionStats", () => {
   test("starts at zero before any calls", () => {
     const server = new LocalLlmServer();
     const stats = JSON.parse(server.sessionStats().content[0].text);
-    assert.deepEqual(stats, { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, perTool: {} });
+    assert.deepEqual(stats, {
+      calls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      perTool: {},
+      thinkingDecisions: { model: null, decided: 0, thinkOn: 0, thinkOff: 0, unsure: 0, failed: 0 },
+    });
   });
 
   test("accumulates usage across calls, with a per-tool breakdown", async () => {

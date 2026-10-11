@@ -50,10 +50,21 @@ These tools read files directly on the MCP server, dramatically reducing convers
     (capped at 50 matched files)
 11. **local_llm_generate_code_with_context** - Generate code using existing files as reference
     patterns. `context_files` also supports glob patterns, same as above
+12. **local_llm_review_diff** - Review git changes without the diff entering the agent's
+    context: the server runs `git diff` itself (read-only). Reviews uncommitted changes by
+    default, only staged ones with `staged: true`, or what a branch adds since `base` (like a
+    pull request: `git diff <base>...HEAD`), optionally limited to `paths`. Each line is
+    labelled with its line number in the new file, so findings cite real `file:line`
+    locations. See "Reviewing git changes" below
+13. **local_llm_digest_file** - Digest a long log or command output file (test run, build,
+    CI log): the outcome with the runner's own counts, each distinct failure with its line
+    numbers and exact message, and the likely cause. Redirect a command's output to a file
+    first (`npm test > /tmp/test.log 2>&1`). Color codes are stripped; logs over about 100k
+    characters keep their start and, mostly, their end, with a marker naming the skipped lines
 
 ### Introspection
 
-12. **local_llm_server_info** - Reports which model your backend currently has loaded, its
+14. **local_llm_server_info** - Reports which model your backend currently has loaded, its
     context size, slot count, and whether it has a chat template — useful for any agent to
     check what's actually running before assuming a model or capability. The context-size/
     slot/chat-template fields come from llama-server's `/props` extension and come back
@@ -62,18 +73,20 @@ These tools read files directly on the MCP server, dramatically reducing convers
     context window it supports (`max_context_size`, from `/api/show`), and the window it's
     actually running at (`context_size`, from `/api/ps`; `null` until the model is loaded).
     See "Using Ollama" below.
-13. **local_llm_session_stats** - Reports cumulative prompt/completion/total token usage sent
+15. **local_llm_session_stats** - Reports cumulative prompt/completion/total token usage sent
     to and received from your backend so far in this session, with a per-tool breakdown —
     based on the `usage` field the backend returns per request. Answers "how many tokens
-    have actually been offloaded to the local model instead of my own context?"
+    have actually been offloaded to the local model instead of my own context?" Also
+    reports `thinkingDecisions`: how often a decision model turned thinking on or off (see
+    "Thinking decisions" below)
 
 ### Primitives
 
-14. **local_llm_tokenize** - Counts how many tokens a piece of text would consume according to
+16. **local_llm_tokenize** - Counts how many tokens a piece of text would consume according to
     the currently loaded tokenizer, via `/tokenize` — a llama.cpp/llama-server extension, not
     a standard OpenAI endpoint. Useful for checking context-window fit before sending large
     content. Not available with Ollama, which has no tokenize endpoint.
-15. **local_llm_semantic_similarity** - Ranks candidate texts by semantic similarity to a query
+17. **local_llm_semantic_similarity** - Ranks candidate texts by semantic similarity to a query
     using the backend's `/v1/embeddings` endpoint (standard OpenAI surface, but requires an
     embeddings-capable model to be loaded — for llama-server, start it with `--embeddings`).
     Returns similarity scores only, never raw embedding vectors, since a 768-4096 float vector
@@ -436,6 +449,53 @@ export const TOOL_REASONING_OVERRIDES = {
 };
 ```
 
+With Ollama the override is sent as Ollama's own `think` flag instead, which works for any
+Ollama thinking model.
+
+### Thinking decisions (Ollama, with a decision model)
+
+A fixed setting per tool can't tell an easy request from a hard one: `fix_code` for a typo
+and for a race condition get the same treatment. With Ollama, a small **decision model**
+such as [Laya](https://ollama.com/library/laya) can choose per request instead. Before each
+chat call, the server asks it whether the request needs low or high reasoning and sends
+`think: false` or `think: true` to the chat model.
+
+- **On automatically** when a model with Ollama's `decision` capability is installed and the
+  chat model has the `thinking` capability: `ollama pull laya`, nothing else to configure.
+  Without a decision model, or with a chat model that can't think, nothing changes.
+- **`LOCAL_LLM_DECISION_MODEL`** picks a specific one (pulled automatically if missing, like
+  the other configured models), e.g. `laya:421m-typed-decisions-mlx-fp16`; `off` disables
+  thinking decisions. Without the setting, an installed decision model is used but never
+  pulled.
+- **Only confident answers count**: below 0.65 probability, or if the decision model fails
+  for any reason, the chat model keeps its own default. A `TOOL_REASONING_OVERRIDES` entry
+  always wins.
+- **What the decision model sees**: the tool's one-line task (e.g. "Review these code changes
+  for bugs, regressions and risky changes."), the agent's own instruction text and the
+  number of code lines. Never the code itself, which wouldn't fit its 512-1024-token input
+  anyway.
+- `local_llm_session_stats` reports the decisions under `thinkingDecisions`.
+
+Measured with Laya and `gemma4:e4b-mlx` on an M4: about 150 ms per decision. It chose low
+for writing `is_even` (answered in 2.3s without thinking) and high for fixing a race
+condition (26s with thinking). On 8 clear-cut test requests it picked the expected level 8
+times out of 8; borderline requests are where it will be wrong, which is why low-confidence
+answers are ignored.
+
+### Reviewing git changes
+
+`local_llm_review_diff` is for changes the agent didn't write or no longer has in view: a
+branch against `main`, a checked-out pull request, or a long session's uncommitted work.
+For edits the agent just made, it already knows the changes. The local model's review is a
+cheap first pass, not a final verdict: expect some false alarms.
+
+It only ever runs `git diff` (and its `--name-only` form), without a shell. Because `git
+diff` has options that write files (`--output=<file>`), a `base` must look like a git ref
+and can't start with `-`, and `paths` are passed after `--`, where git treats them as paths.
+A repository's own configuration can't make it run programs either: external diff drivers
+and textconv filters are skipped (`--no-ext-diff`, `--no-textconv`) and fsmonitor is
+switched off. Untracked files aren't part of `git diff`; `git add -N <file>` includes them.
+
 ### CodeGraph Context Enrichment (optional)
 
 If the project being reviewed has a CodeGraph index (`.codegraph/` directory present, from
@@ -500,6 +560,13 @@ Add new tools by:
 5. **Agent refines**: Adds context or additional insights
 6. **Token savings**: ~98.75% compared to reading the file into conversation first
 
+### Test Failure Workflow
+1. **Agent runs**: `npm test > /tmp/test.log 2>&1` instead of reading the output directly
+2. **Agent calls**: `local_llm_digest_file` with `/tmp/test.log`
+3. **Local model**: reports e.g. "tests 3, pass 1, fail 1, cancelled 1" and each failure
+   with its line numbers
+4. **Agent reads**: only those lines of the log, if it needs more
+
 ### Multi-File Analysis Workflow
 1. **User asks**: "How do index.js and package.json relate?"
 2. **Agent calls**: `local_llm_analyze_files` with both file paths
@@ -545,6 +612,8 @@ local-llm-mcp/
 │   ├── prompts.test.js
 │   ├── server.test.js
 │   ├── ollama.test.js
+│   ├── discovery.test.js
+│   ├── review-diff.test.js
 │   ├── server-unreachable.test.js
 │   └── integration.test.js
 ├── scripts/

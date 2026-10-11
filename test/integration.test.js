@@ -81,11 +81,11 @@ test("initialize response includes server instructions steering the calling agen
   assert.match(instructions, /no internet access/);
 });
 
-test("tools/list exposes all 15 local_llm_* tools", async () => {
+test("tools/list exposes all 17 local_llm_* tools", async () => {
   const id = send("tools/list", {});
   const response = await waitForResponse(id);
   const names = response.result.tools.map((t) => t.name);
-  assert.equal(names.length, 15);
+  assert.equal(names.length, 17);
   assert.ok(names.every((n) => n.startsWith("local_llm_")));
   assert.ok(names.includes("local_llm_server_info"));
   assert.ok(names.includes("local_llm_session_stats"));

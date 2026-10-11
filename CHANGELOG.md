@@ -1,5 +1,37 @@
 # Changelog
 
+## Version 3.4.0 - Thinking decisions, review_diff, digest_file
+
+### Features
+- **Thinking decisions (Ollama).** A decision model such as Laya (`ollama pull laya`) chooses
+  per request whether the chat model thinks: before each chat call the server asks it
+  (`POST /v1/systemone`) for low or high reasoning and sends `think: false/true`. On
+  automatically when a model with the `decision` capability is installed and the chat model
+  has `thinking`; `LOCAL_LLM_DECISION_MODEL` pins one (pulled if missing) or `off` disables it.
+  Only answers at probability >= 0.65 apply (shipped decision models are over-confident);
+  anything else, or a failure, keeps the model's default. `TOOL_REASONING_OVERRIDES` still
+  wins. The decision model sees the tool's one-line task, the agent's instruction and the
+  code line count, never the code: without the task line, a review with no focus came back
+  "low" (0.74); with it, "high" (0.79). `local_llm_session_stats` reports
+  `thinkingDecisions`. Measured with Laya and gemma4:e4b on an M4: ~150 ms per decision,
+  low for `is_even` (2.3s answer), high for a race-condition fix (26s).
+- **`local_llm_review_diff`**: reviews git changes (uncommitted, staged, or a branch since
+  `base`) by running `git diff` server-side, so the diff never enters the agent's context.
+  Lines carry their new-file line numbers, so findings cite real `file:line` locations.
+  Safety: no shell, only `git diff`, refs validated (never starting with `-`, since
+  `git diff --output=` writes files), paths after `--`, and `--no-ext-diff`, `--no-textconv`
+  and `core.fsmonitor=false` so a repository's config can't run programs.
+- **`local_llm_digest_file`**: digests a long log or command output file into the outcome
+  (counts copied from the runner's summary, including cancelled/skipped), each failure with
+  its line numbers and exact message, and the likely cause. Color codes stripped; logs over
+  ~100k characters keep 20% start / 80% end with an omitted-lines marker. The server
+  instructions suggest redirecting long command output to a file and digesting it.
+
+### Tests
+- Thinking decisions in `test/ollama.test.js` (mock `/v1/systemone`); `test/review-diff.test.js`
+  against real temporary git repositories, including option injection and a hostile repo
+  config; `digestFile` in `test/server.test.js`. 169 passing.
+
 ## Version 3.3.0 - Find the local server automatically
 
 ### Features

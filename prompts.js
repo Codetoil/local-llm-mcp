@@ -96,6 +96,22 @@ export const DEFAULT_PROMPTS = {
     user: (args) => `TASK: ${args.task}\n\n${args.filesContent}${codeGraphSection(args)}`,
   },
 
+  digest_file: {
+    system:
+      "You digest logs and command output (test runs, builds, CI logs, stack traces) for a developer who will not read the log. Report, in this order: 1. The outcome in one line: passed or failed, with every count copied from the runner's own summary lines if the log has them, including cancelled, skipped or timed-out ones (e.g. \"tests 3, pass 1, fail 1, cancelled 1\"); never count them yourself. 2. Each distinct error or failure: its line number(s) and the key message quoted exactly. Group repeats (e.g. \"repeated 40 times, lines 120-480\"). 3. The likely cause, only if the log supports it. Skip passing tests, progress output and other noise. Each line is prefixed with its line number and a tab; cite those numbers and never re-derive them. If part of the log was omitted, say so when it could matter. Don't invent causes or messages the log doesn't show.",
+    user: (args) =>
+      `${args.question ? `QUESTION: ${args.question}\n\n` : ""}FILE: ${args.fileName}\nPATH: ${args.filePath}\nLINES: ${args.totalLines}${
+        args.omitted ? ` (lines ${args.omitted.from}-${args.omitted.to} omitted to fit; the start and end are shown)` : ""
+      }\n\nCONTENT (line-numbered):\n${args.content}`,
+  },
+
+  review_diff: {
+    system:
+      "You are a code review assistant reviewing a set of changes given as a unified diff. Comment on what the changes introduce: bugs, regressions, risky or incomplete changes, missing error handling, and security concerns. Don't review unchanged code except where a change breaks it. Each line that exists in the new version of a file is prefixed with its line number there; removed lines have no number. Cite the file and that line number for every finding (e.g. \"src/app.js:42: ...\"), and never re-derive line numbers yourself. Be concise and specific; if the changes look correct, say so briefly rather than inventing issues.",
+    user: (args) =>
+      `Review the following ${args.description} with focus on ${args.focus || "bugs, regressions and risky changes"}.\n\nCHANGED FILES:\n${args.changedFiles.join("\n")}\n\nDIFF (new-file line numbers on the left):\n${args.diff}${codeGraphSection(args)}`,
+  },
+
   generate_code_with_context: {
     system:
       "You are a code generation assistant. Generate clean, well-commented code based on the requirements given, following the patterns shown in the reference files. Respond with ONLY the code, no explanations or markdown formatting. Make sure the code is production-ready.",
@@ -104,7 +120,7 @@ export const DEFAULT_PROMPTS = {
   },
 };
 
-// Shared by the four file-aware tools above: folds in CodeGraph-derived context (call
+// Shared by the file-aware tools above: folds in CodeGraph-derived context (call
 // paths, blast radius) when index.js's getCodeGraphContext() found a .codegraph/ index for
 // the project, empty string otherwise.
 function codeGraphSection(args) {
@@ -149,6 +165,14 @@ export const FAMILY_OVERRIDES = {
       system:
         "You are a code explanation assistant. Provide a clear, comprehensive explanation of what the file does, how it works, and any important patterns or considerations. Each line of the code below is prefixed with its line number and a tab (e.g. `12\\t...`) -- reference specific line numbers when pointing out a section, rather than describing location vaguely. Write in plain prose paragraphs -- no emoji, no markdown headers, tables, or horizontal rules. Stay grounded in the file given; don't pad the explanation with generic background or unrelated caveats.",
     },
+    digest_file: {
+      system:
+        "You digest logs and command output (test runs, builds, CI logs, stack traces) for a developer who will not read the log. Report, in this order: 1. The outcome in one line: passed or failed, with every count copied from the runner's own summary lines if the log has them, including cancelled, skipped or timed-out ones (e.g. \"tests 3, pass 1, fail 1, cancelled 1\"); never count them yourself. 2. Each distinct error or failure: its line number(s) and the key message quoted exactly. Group repeats (e.g. \"repeated 40 times, lines 120-480\"). 3. The likely cause, only if the log supports it. Skip passing tests, progress output and other noise. Each line is prefixed with its line number and a tab; cite those numbers and never re-derive them. If part of the log was omitted, say so when it could matter. Don't invent causes or messages the log doesn't show. Write in plain text -- no emoji, no decorative section headers, no markdown tables.",
+    },
+    review_diff: {
+      system:
+        "You are a code review assistant reviewing a set of changes given as a unified diff. Comment on what the changes introduce: bugs, regressions, risky or incomplete changes, missing error handling, and security concerns. Don't review unchanged code except where a change breaks it. Each line that exists in the new version of a file is prefixed with its line number there; removed lines have no number. Cite the file and that line number for every finding (e.g. \"src/app.js:42: ...\"), and never re-derive line numbers yourself. Be concise and specific; if the changes look correct, say so briefly rather than inventing issues. Write in plain text -- no emoji, no decorative section headers, no markdown tables. Don't append rewritten versions of the changed files unless the task asks for them.",
+    },
     analyze_files: {
       system:
         "You are a code analysis assistant. Provide a comprehensive analysis addressing the task. Focus on relationships, patterns, and insights across all files. Each file's code below is prefixed line-by-line with its own line number and a tab (e.g. `12\\t...`) -- cite exact file:line locations for any finding (e.g. \"README.md:42\"), and never renumber or re-derive line numbers yourself. Write in plain text -- no emoji, no decorative section headers, no markdown tables.",
@@ -176,7 +200,9 @@ export const TOOL_MODEL_PREFERENCES = {};
 // silently ignore it for templates that don't recognize it. With Ollama it's sent as Ollama's
 // own `think` flag instead, which works for any Ollama thinking model. Populate your own, e.g.
 // { generate_code: false, fix_code: true } to skip thinking on quick generation but keep
-// it for harder debugging.
+// it for harder debugging. With Ollama and a decision model installed (e.g. Laya), tools
+// without an entry here get a per-request decision instead (see decideThinking in index.js);
+// an entry here always wins over that.
 export const TOOL_REASONING_OVERRIDES = {};
 
 export function buildMessages(toolName, args, family) {

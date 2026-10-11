@@ -53,6 +53,40 @@ const TRUNCATED_CHARS_PER_TOKEN = 8;
 const MODEL_CACHE_TTL_MS = 30_000;
 // Pulling a configured model can mean a multi-GB download; allow far longer than a chat call.
 const PULL_TIMEOUT_MS = 60 * 60_000;
+// Thinking decisions (Ollama): a decision model (e.g. Laya) answers "low or high reasoning?"
+// per request, and its answer only replaces the chat model's own default when it's at least
+// this sure -- shipped decision models are known to be over-confident, so this stays strict.
+const DECISION_MIN_PROBABILITY = 0.65;
+const DECISION_TIMEOUT_MS = 15_000; // the first call loads the decision model (~3s for Laya)
+const DECISION_REQUEST_CHAR_LIMIT = 1500; // Laya reads 512-1024 tokens; keep the state well inside
+const DECISION_QUESTIONS = {
+  effort: {
+    type: "choice",
+    instructions: "How much reasoning does this coding request need before answering?",
+    criteria: {
+      low: "mechanical or boilerplate: one obvious step, no analysis needed",
+      high: "needs analysis: debugging, security, concurrency, or multi-step design",
+    },
+  },
+};
+const GIT_TIMEOUT_MS = 30_000;
+const GIT_MAX_BUFFER = 50 * 1024 * 1024;
+// What review_diff accepts as a ref (branch, tag, HEAD~2, origin/main, a SHA). It can never
+// start with "-", so it can't be read as an option: `git diff --output=<file>` writes files.
+const SAFE_GIT_REF = /^[A-Za-z0-9_./@{}~^][A-Za-z0-9_./@{}~^-]*$/;
+// Always passed to git for review_diff, so a repository's own config can't make it run
+// programs: fsmonitor hooks are switched off, external diff drivers and textconv filters are
+// skipped by the diff flags.
+const GIT_SAFE_CONFIG = ["-c", "core.fsmonitor=false"];
+const GIT_DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv"];
+// How much of a log digest_file sends: about 30k tokens of typical log text, which fits the
+// 32k minimum window with room for the answer. Longer logs keep their start and, mostly, their
+// end, where test runners and builds print failures and summaries.
+const DIGEST_CHAR_BUDGET = 100_000;
+const DIGEST_HEAD_SHARE = 0.2;
+// Terminal color and cursor codes, which logs captured from a TTY are full of.
+// eslint-disable-next-line no-control-regex -- matching the ESC character is the point
+const ANSI_ESCAPES = /\x1b\[[0-9;?]*[A-Za-z]/g;
 const GLOB_METACHARACTERS = /[*?[{]/;
 const MAX_GLOB_MATCHES = 50;
 const CODEGRAPH_CONTEXT_CHAR_LIMIT = 4000;
@@ -60,7 +94,9 @@ const CODEGRAPH_TIMEOUT_MS = 5000;
 
 const SERVER_INSTRUCTIONS = `Offloads code-shaped work (generation, review, refactoring, explanation, test-writing) to a local LLM, saving your own context budget.
 
-For anything already on disk, prefer the file-aware tools (local_llm_review_file, local_llm_explain_file, local_llm_analyze_files, local_llm_generate_code_with_context) over reading the file yourself and pasting it into the string-based tools -- the file-aware tools read server-side, at roughly 50 tokens of your context versus thousands for a full read. local_llm_analyze_files also works well for cross-file consistency checks (e.g. "do these docs agree with each other"), not just dependency/relationship analysis.
+For anything already on disk, prefer the file-aware tools (local_llm_review_file, local_llm_explain_file, local_llm_analyze_files, local_llm_generate_code_with_context, local_llm_digest_file, local_llm_review_diff) over reading the file yourself and pasting it into the string-based tools -- the file-aware tools read server-side, at roughly 50 tokens of your context versus thousands for a full read. local_llm_analyze_files also works well for cross-file consistency checks (e.g. "do these docs agree with each other"), not just dependency/relationship analysis.
+
+For commands with long output (test suites, builds, CI logs), redirect the output to a file (e.g. \`npm test > /tmp/test.log 2>&1\`) and call local_llm_digest_file on it instead of reading the output yourself; it reports the failures with line numbers, so you can then read just those lines. To review git changes you didn't write or no longer have in view (a branch against main, a checked-out PR, a long session's uncommitted work), use local_llm_review_diff; it runs git diff itself.
 
 This server has no internet access and no knowledge of anything outside the files you point it at. Don't use it for questions needing current external knowledge (library APIs, changelogs, GitHub issues, current docs) -- it will confabulate specifics rather than refuse. Verify its output before trusting it, the same way you would a fast but occasionally-wrong reviewer.`;
 
@@ -74,6 +110,101 @@ const MODEL_ARG_SCHEMA = {
 // away while a kept-alive connection to it was still open.
 function isUnreachable(error) {
   return error.code === "ECONNREFUSED" || error.code === "ECONNRESET";
+}
+
+// The part of a log that digest_file sends, line-numbered with the original line numbers. Fits
+// DIGEST_CHAR_BUDGET by keeping whole lines from the start (DIGEST_HEAD_SHARE of the budget) and
+// the end (the rest), with a marker naming the lines left out in between.
+function digestContent(raw) {
+  const content = raw.replace(ANSI_ESCAPES, "");
+  const lines = content.split("\n");
+  const numbered = (from, to) => lines.slice(from, to).map((line, i) => `${from + i + 1}\t${line}`);
+  if (content.length <= DIGEST_CHAR_BUDGET) {
+    return { text: numbered(0, lines.length).join("\n"), totalLines: lines.length, omitted: null };
+  }
+
+  // Counts each line as sent: its line-number prefix, the line and its newline.
+  const take = (budget, indices) => {
+    let used = 0;
+    let count = 0;
+    for (const index of indices) {
+      used += String(index + 1).length + 1 + lines[index].length + 1;
+      if (used > budget) break;
+      count += 1;
+    }
+    return count;
+  };
+  const headCount = take(DIGEST_CHAR_BUDGET * DIGEST_HEAD_SHARE, lines.keys());
+  const tailIndices = Array.from({ length: lines.length - headCount }, (_, i) => lines.length - 1 - i);
+  const tailCount = take(DIGEST_CHAR_BUDGET * (1 - DIGEST_HEAD_SHARE), tailIndices);
+  const omitted = { from: headCount + 1, to: lines.length - tailCount };
+  const marker = `[... lines ${omitted.from}-${omitted.to} omitted (${omitted.to - omitted.from + 1} lines) ...]`;
+  return {
+    text: [...numbered(0, headCount), marker, ...numbered(lines.length - tailCount, lines.length)].join("\n"),
+    totalLines: lines.length,
+    omitted,
+  };
+}
+
+// Prefixes every line of a unified diff that exists in the new version of a file (context and
+// added lines) with that line number, read from the hunk headers, and leaves the number blank
+// for removed lines. A small model can then cite real file:line locations without having to
+// work them out from "@@ -a,b +c,d @@" itself, which it does unreliably.
+function annotateDiff(diff) {
+  let newLine = null;
+  return diff
+    .split("\n")
+    .map((line) => {
+      const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (hunk) {
+        newLine = Number(hunk[1]);
+        return line;
+      }
+      if (newLine === null || line.startsWith("diff --git ")) {
+        newLine = null;
+        return line;
+      }
+      if (line.startsWith("-")) return `${"".padStart(6)} ${line}`;
+      if (line.startsWith("+") || line.startsWith(" ")) return `${String(newLine++).padStart(6)} ${line}`;
+      return line; // "\ No newline at end of file" and the like
+    })
+    .join("\n");
+}
+
+// One line saying what each tool does, sent to the decision model ahead of the agent's own
+// instruction. Without it, a review called with no focus reaches Laya as an empty request and
+// comes back "low" (measured: review_diff went from low 0.74 to high 0.79 with this line).
+const DECISION_TASKS = {
+  generate_code: "Write new code to these requirements.",
+  generate_code_with_context: "Write new code to these requirements, following the reference files.",
+  explain_code: "Explain what this code does and how it works.",
+  explain_file: "Explain what this code does and how it works.",
+  review_code: "Review this code for bugs, security issues and code quality problems.",
+  review_file: "Review this code for bugs, security issues and code quality problems.",
+  review_diff: "Review these code changes for bugs, regressions and risky changes.",
+  refactor_code: "Refactor this code.",
+  fix_code: "Fix the bug in this code.",
+  write_tests: "Write unit tests for this code.",
+  analyze_files: "Analyze these files together.",
+  digest_file: "Summarize this log or output: find the errors and failures and their likely cause.",
+};
+
+// What a decision model sees of a request: the tool, what it does, the calling agent's own
+// instruction text (whichever of these fields the tool has), and how much code comes with it --
+// never the code itself, which wouldn't fit a decision model's 512-1024-token input anyway.
+function decisionState(toolName, args) {
+  const instruction = [DECISION_TASKS[toolName], args.prompt, args.task, args.goal, args.error, args.focus, args.context, args.question]
+    .filter((part) => typeof part === "string" && part.trim())
+    .join("\n")
+    .slice(0, DECISION_REQUEST_CHAR_LIMIT);
+  const code = [args.code, args.filesContent, args.contextSection, args.diff, args.content]
+    .filter((part) => typeof part === "string")
+    .join("\n");
+  return {
+    tool: toolName,
+    request: instruction || "(no instructions beyond the tool itself)",
+    code_lines: code ? code.split("\n").length : 0,
+  };
 }
 
 // Whether an executable of this name is on PATH, for the "installed but not running" hint.
@@ -186,6 +317,7 @@ class LocalLlmServer {
     this.target = null;
     this.pulls = new Map();
     this.tokenStats = { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, perTool: {} };
+    this.thinkingDecisions = { model: null, decided: 0, thinkOn: 0, thinkOff: 0, unsure: 0, failed: 0 };
 
     this.setupToolHandlers();
 
@@ -413,6 +545,58 @@ class LocalLlmServer {
           },
         },
         {
+          name: "local_llm_digest_file",
+          description: "Digest a long log or command output file (test run, build, CI log, stack traces) with your local LLM server: it reports the outcome, each distinct error or failure with its line numbers and exact message, and the likely cause, instead of you reading thousands of lines. Redirect a command's output to a file first (e.g. `npm test > /tmp/test.log 2>&1`). Very long files are cut to their start and end, where failures and summaries usually are.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              file_path: {
+                type: "string",
+                description: "Absolute path to the log or output file",
+              },
+              question: {
+                type: "string",
+                description: "What to look for, if more specific than errors and failures (e.g. \"why did the integration tests time out?\")",
+              },
+              model: MODEL_ARG_SCHEMA,
+            },
+            required: ["file_path"],
+          },
+        },
+        {
+          name: "local_llm_review_diff",
+          description: "Review git changes with your local LLM server. The server runs `git diff` itself (read-only) and reviews the result, so the diff never enters your context. Use it for changes you didn't write or no longer have in view: a branch against main, a checked-out PR, or a long session's uncommitted work before committing. Findings cite file:line in the new version. Untracked files aren't included.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo_path: {
+                type: "string",
+                description: "Absolute path to the git repository (or any directory inside it)",
+              },
+              base: {
+                type: "string",
+                description: "Review what the current branch adds since it left this ref, like a pull request (git diff <base>...HEAD), e.g. \"main\" or \"origin/main\". Omit to review uncommitted changes (staged and unstaged) instead.",
+              },
+              staged: {
+                type: "boolean",
+                description: "Review only staged changes (git diff --cached). Can't be combined with base.",
+                default: false,
+              },
+              paths: {
+                type: "array",
+                items: { type: "string" },
+                description: "Limit the review to these files or directories (relative to the repository)",
+              },
+              focus: {
+                type: "string",
+                description: "What to focus on (e.g., \"security\", \"error handling\"); defaults to bugs, regressions and risky changes",
+              },
+              model: MODEL_ARG_SCHEMA,
+            },
+            required: ["repo_path"],
+          },
+        },
+        {
           name: "local_llm_server_info",
           description: "Report which model the local LLM server currently has loaded, its context size, and its capabilities. Use this to check what's actually running before assuming a model or capability.",
           inputSchema: {
@@ -497,6 +681,10 @@ class LocalLlmServer {
             return await this.analyzeFiles(args);
           case "local_llm_generate_code_with_context":
             return await this.generateCodeWithContext(args);
+          case "local_llm_review_diff":
+            return await this.reviewDiff(args);
+          case "local_llm_digest_file":
+            return await this.digestFile(args);
           case "local_llm_server_info":
             return await this.serverInfo();
           case "local_llm_session_stats":
@@ -748,12 +936,17 @@ class LocalLlmServer {
     const { model: explicitModel, ...promptArgs } = args;
     const resolved = await this.resolveModel(explicitModel, toolName);
     const messages = buildMessages(toolName, promptArgs, resolved.family);
-    const enableThinking = TOOL_REASONING_OVERRIDES[toolName];
+    const backend = await this.detectBackend();
+    // A fixed per-tool setting wins; otherwise a decision model may choose per request.
+    let enableThinking = TOOL_REASONING_OVERRIDES[toolName];
+    if (enableThinking === undefined && backend === "ollama") {
+      enableThinking = await this.decideThinking(toolName, promptArgs, resolved.id);
+    }
 
     let completion;
     try {
       completion =
-        (await this.detectBackend()) === "ollama"
+        backend === "ollama"
           ? await this.ollamaChat(resolved.id, messages, enableThinking)
           : await this.openAiChat(resolved.id, messages, enableThinking);
     } catch (error) {
@@ -781,6 +974,57 @@ class LocalLlmServer {
       text += `\n\n[WARNING: response was truncated at the ${MAX_TOKENS}-token generation limit (LOCAL_LLM_MAX_TOKENS) before finishing. Consider a narrower request, or raise the limit.]`;
     }
     return text;
+  }
+
+  // Asks a decision model (Ollama's POST /v1/systemone, e.g. Laya) whether this request needs
+  // the chat model to think, and returns true/false -- or undefined to leave the chat model's
+  // own default, which is also what happens when there's no decision model, the chat model
+  // can't think, the answer isn't sure enough, or anything fails. Never fails the call.
+  async decideThinking(toolName, promptArgs, chatModel) {
+    let decisionModel;
+    try {
+      decisionModel = await this.resolveDecisionModel();
+      if (!decisionModel) return undefined;
+      const chat = (await this.fetchAvailableModels()).find((model) => model.id === chatModel);
+      if (!chat?.capabilities?.includes("thinking")) return undefined;
+    } catch {
+      return undefined;
+    }
+
+    this.thinkingDecisions.model = decisionModel;
+    try {
+      const response = await axios.post(
+        `${await this.serverUrl()}/v1/systemone`,
+        { model: decisionModel, state: decisionState(toolName, promptArgs), questions: DECISION_QUESTIONS },
+        { timeout: DECISION_TIMEOUT_MS }
+      );
+      const { choice, probabilities } = response.data?.answers?.effort ?? {};
+      if (choice !== "low" && choice !== "high") throw new Error("no effort answer");
+      this.thinkingDecisions.decided += 1;
+      if ((probabilities?.[choice] ?? 0) < DECISION_MIN_PROBABILITY) {
+        this.thinkingDecisions.unsure += 1;
+        return undefined;
+      }
+      this.thinkingDecisions[choice === "high" ? "thinkOn" : "thinkOff"] += 1;
+      return choice === "high";
+    } catch {
+      this.thinkingDecisions.failed += 1;
+      return undefined;
+    }
+  }
+
+  // LOCAL_LLM_DECISION_MODEL picks the decision model ("off" disables thinking decisions) and is
+  // pulled if missing, like the other configured models. Unset, the first installed model with
+  // Ollama's "decision" capability is used -- never pulled, so nobody gets a surprise download.
+  async resolveDecisionModel() {
+    const configured = process.env.LOCAL_LLM_DECISION_MODEL;
+    if (configured === "off") return null;
+    if (configured) {
+      await this.ensureOllamaModel(configured);
+      return configured;
+    }
+    const models = await this.fetchAvailableModels();
+    return models.find((model) => model.capabilities?.includes("decision"))?.id ?? null;
   }
 
   async openAiChat(model, messages, enableThinking) {
@@ -908,7 +1152,8 @@ class LocalLlmServer {
   }
 
   sessionStats() {
-    return { content: [{ type: "text", text: JSON.stringify(this.tokenStats, null, 2) }] };
+    const stats = { ...this.tokenStats, thinkingDecisions: this.thinkingDecisions };
+    return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
   }
 
   async tokenize(args) {
@@ -1086,6 +1331,76 @@ class LocalLlmServer {
       prompt,
       language,
       contextSection,
+      codeGraphContext,
+      model,
+    });
+    return { content: [{ type: "text", text: response }] };
+  }
+
+  async digestFile(args) {
+    const { file_path, question, model } = args;
+    const raw = await this.readFile(file_path);
+    const { text, totalLines, omitted } = digestContent(raw);
+    const response = await this.callLocalLlm("digest_file", {
+      content: text,
+      question,
+      fileName: path.basename(file_path),
+      filePath: file_path,
+      totalLines,
+      omitted,
+      model,
+    });
+    return { content: [{ type: "text", text: response }] };
+  }
+
+  async reviewDiff(args) {
+    const { repo_path, base, staged, paths = [], focus, model } = args;
+    if (!repo_path || !path.isAbsolute(repo_path)) {
+      throw new Error("repo_path must be an absolute path to a git repository.");
+    }
+    if (base !== undefined && staged) {
+      throw new Error("Use either base or staged, not both.");
+    }
+    if (base !== undefined && !SAFE_GIT_REF.test(base)) {
+      throw new Error(`Not a valid git ref: ${JSON.stringify(base)}. Use a branch, tag or commit such as "main" or "origin/main".`);
+    }
+    if (!Array.isArray(paths) || paths.some((entry) => typeof entry !== "string")) {
+      throw new Error("paths must be an array of strings.");
+    }
+
+    const range = staged ? ["--cached"] : base !== undefined ? [`${base}...HEAD`] : ["HEAD"];
+    const description = staged
+      ? "staged changes"
+      : base !== undefined
+        ? `changes on the current branch since ${base}`
+        : "uncommitted changes (staged and unstaged)";
+    // Paths go after "--", where git treats everything as a path, never as an option.
+    const git = async (extra) => {
+      try {
+        const { stdout } = await execFileAsync(
+          "git",
+          [...GIT_SAFE_CONFIG, "diff", ...GIT_DIFF_FLAGS, ...extra, ...range, "--", ...paths],
+          { cwd: repo_path, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER }
+        );
+        return stdout;
+      } catch (error) {
+        const reason = error.stderr?.trim() || error.message;
+        throw new Error(`git diff failed in ${repo_path}: ${reason}`, { cause: error });
+      }
+    };
+
+    const changedFiles = (await git(["--name-only"])).split("\n").filter(Boolean);
+    if (changedFiles.length === 0) {
+      return { content: [{ type: "text", text: `No changes to review: ${description} are empty.` }] };
+    }
+    const diff = await git([]);
+    const codeGraphContext = await getCodeGraphContext(changedFiles.map((file) => path.basename(file)).join(" "), repo_path);
+
+    const response = await this.callLocalLlm("review_diff", {
+      diff: annotateDiff(diff),
+      changedFiles,
+      description,
+      focus,
       codeGraphContext,
       model,
     });
