@@ -16,6 +16,14 @@ stands in for `llama-server`'s `/v1/models`, `/v1/chat/completions`, and `/props
   prompt overrides
 - `test/server.test.js` — `LocalLlmServer` methods directly: model resolution/caching, file-aware
   tools, `serverInfo`
+- `test/ollama.test.js` — the Ollama backend against a mock shaped after real Ollama responses:
+  model selection, context windows, auto-pull, thinking decisions (`/v1/systemone`)
+- `test/discovery.test.js` — finding the server without `LOCAL_LLM_BASE_URL` (candidate list
+  pointed at mocks, never the real default ports)
+- `test/review-diff.test.js` — `review_diff` against real temporary git repositories, including
+  option injection and a repository whose config tries to run programs
+- `test/hooks.test.js` — the plugin's shell hooks run as real processes: which prompts get which
+  tool hint, the Read gate's deny-then-allow, and both staying silent when no server answers
 - `test/server-unreachable.test.js` — the friendly connection-error path when `llama-server` is down
 - `test/integration.test.js` — spawns the real `node index.js` entry point and drives it over MCP
   JSON-RPC (`tools/list`, `tools/call`), the same way any MCP client (Claude Code, Cursor, etc.) does
@@ -132,6 +140,42 @@ These tools read files directly on the MCP server, reducing conversation token u
 - Local model generates code matching the existing patterns
 - Returns code that follows project conventions
 - **Token savings**: Reference files handled server-side
+
+#### Test: local_llm_review_diff
+
+```javascript
+// In a repository with uncommitted changes:
+{ "repo_path": "/absolute/path/to/repo" }
+// A branch against main, security focus:
+{ "repo_path": "/absolute/path/to/repo", "base": "main", "focus": "security" }
+```
+
+**Expected behavior:**
+- Findings cite `file:line` in the new version of each file, and the lines match
+- A clean tree returns "No changes to review" without calling the model
+- `"base": "--output=/tmp/x"` is refused as "Not a valid git ref", and no file is written
+
+#### Test: local_llm_digest_file
+
+```javascript
+// After: npm test > /tmp/test.log 2>&1
+{ "file_path": "/tmp/test.log" }
+```
+
+**Expected behavior:**
+- The outcome line copies the runner's own counts (e.g. "tests 3, pass 1, fail 1, cancelled 1")
+- Each failure is listed with line numbers that match the log
+- On a log over ~100k characters, the answer mentions the omitted middle when it matters
+
+#### Test: thinking decisions (Ollama + Laya)
+
+With `laya` installed and a thinking-capable chat model, run `local_llm_generate_code` for a
+trivial function and `local_llm_fix_code` for a concurrency bug, then
+`local_llm_session_stats`.
+
+**Expected behavior:**
+- `thinkingDecisions` shows the decision model, with `thinkOff` and `thinkOn` both counted
+- The trivial request answers in seconds; the bug fix takes longer and reasons first
 
 #### Test: local_llm_server_info
 

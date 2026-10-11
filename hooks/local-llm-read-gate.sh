@@ -41,8 +41,9 @@ touch "$STATE_FILE"
 grep -qF "$file_path" "$STATE_FILE" 2>/dev/null && allow
 
 # Connectivity gate: only enforce if a local LLM server is actually up.
-BASE_URL="${LOCAL_LLM_BASE_URL:-http://localhost:8080}"
-curl -sf --max-time 1 "$BASE_URL/v1/models" >/dev/null 2>&1 || allow
+# shellcheck source=local-llm-common.sh
+. "$(dirname "$0")/local-llm-common.sh"
+local_llm_reachable || allow
 
 printf '%s\n' "$file_path" >> "$STATE_FILE"
 

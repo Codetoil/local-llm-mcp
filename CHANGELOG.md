@@ -1,19 +1,19 @@
 # Changelog
 
-## Version 3.2.0 - Embed-only mode for embedding-model backends
+## Version 3.6.0 - Embed-only mode for embedding-model backends
 
 ### Features
 - **`LOCAL_LLM_EMBED_ONLY`**: set it (`1`/`true`/`yes`/`on`, case-insensitive) to front an
   embedding model instead of a generative one. An embedding backend serves `/v1/embeddings`
   and `/tokenize` but has no chat-completion endpoint and usually no chat template, so the
-  twelve chat-backed tools can only ever fail against it. In this mode `ListTools` is
+  fourteen chat-backed tools can only ever fail against it. In this mode `ListTools` is
   filtered to the three tools such a backend can serve (`semantic_similarity`, `tokenize`,
   `server_info`), the MCP `instructions` describe an embedding server rather than code
   offloading, and `server_info` reports `embed_only`. A chat tool called anyway — by a client
   holding a tool list from before the flag was set — fails with an error naming the mode and
   the available tools, instead of a 404 from `/v1/chat/completions` or a missing-template
   error from the backend. The motivating case is one agent with several of these servers
-  configured at once, where an embeddings backend would otherwise contribute twelve tools
+  configured at once, where an embeddings backend would otherwise contribute fourteen tools
   indistinguishable from the generative server's.
 
 ### Fixes
@@ -34,6 +34,147 @@
   `/v1/chat/completions`, and `embed_only: true` in `server_info`. Its own process, since
   the flag is read at module import time like `LOCAL_LLM_BASE_URL`.
 - Added an all-NaN embedding case to `test/server.test.js`'s `semanticSimilarity` suite.
+
+## Version 3.5.0 - Prompt hook that points Claude at the right tool
+
+### Added
+- **`UserPromptSubmit` hook** (`hooks/local-llm-prompt-nudge.sh`, Claude Code plugin): when a
+  prompt asks to review git changes, look into test/build/CI output or logs, review or explain
+  a file, or relate several files, it adds one line to Claude's context naming the matching
+  `local_llm_*` tool and noting that it's a deferred MCP tool. Claude Code loads MCP tools as
+  deferred names, and on a fresh install Claude rarely used them unprompted. Words are matched
+  first, so most prompts cost no network call; a hint is only added when a local LLM server
+  answers (~40 ms on a match against a real Ollama). Silent otherwise.
+- `hooks/local-llm-common.sh`: the server check, now shared by both hooks.
+- `test/hooks.test.js`: both hooks run as real processes (23 tests), including the Read gate,
+  which had no tests before.
+
+### Added (scripts)
+- `scripts/ollama-patch-env.sh`: sets Ollama's server-side environment variables (e.g.
+  `OLLAMA_CONTEXT_LENGTH`) in the Homebrew launchd plist and reloads the service; a no-op when
+  they're already set. Described in the README's "Using Ollama" section.
+
+### Fixed
+- `ollama-patch-env.sh` took its `.bak` backup after editing the plist, so the backup held the
+  patched file. It now saves the original before any change and keeps it as `.bak` only when
+  something changed.
+
+## Version 3.4.0 - Thinking decisions, review_diff, digest_file
+
+### Features
+- **Thinking decisions (Ollama).** A decision model such as Laya (`ollama pull laya`) chooses
+  per request whether the chat model thinks: before each chat call the server asks it
+  (`POST /v1/systemone`) for low or high reasoning and sends `think: false/true`. On
+  automatically when a model with the `decision` capability is installed and the chat model
+  has `thinking`; `LOCAL_LLM_DECISION_MODEL` pins one (pulled if missing) or `off` disables it.
+  Only answers at probability >= 0.65 apply (shipped decision models are over-confident);
+  anything else, or a failure, keeps the model's default. `TOOL_REASONING_OVERRIDES` still
+  wins. The decision model sees the tool's one-line task, the agent's instruction and the
+  code line count, never the code: without the task line, a review with no focus came back
+  "low" (0.74); with it, "high" (0.79). `local_llm_session_stats` reports
+  `thinkingDecisions`. Measured with Laya and gemma4:e4b on an M4: ~150 ms per decision,
+  low for `is_even` (2.3s answer), high for a race-condition fix (26s).
+- **`local_llm_review_diff`**: reviews git changes (uncommitted, staged, or a branch since
+  `base`) by running `git diff` server-side, so the diff never enters the agent's context.
+  Lines carry their new-file line numbers, so findings cite real `file:line` locations.
+  Safety: no shell, only `git diff`, refs validated (never starting with `-`, since
+  `git diff --output=` writes files), paths after `--`, and `--no-ext-diff`, `--no-textconv`
+  and `core.fsmonitor=false` so a repository's config can't run programs.
+- **`local_llm_digest_file`**: digests a long log or command output file into the outcome
+  (counts copied from the runner's summary, including cancelled/skipped), each failure with
+  its line numbers and exact message, and the likely cause. Color codes stripped; logs over
+  ~100k characters keep 20% start / 80% end with an omitted-lines marker. The server
+  instructions suggest redirecting long command output to a file and digesting it.
+
+### Tests
+- Thinking decisions in `test/ollama.test.js` (mock `/v1/systemone`); `test/review-diff.test.js`
+  against real temporary git repositories, including option injection and a hostile repo
+  config; `digestFile` in `test/server.test.js`. 169 passing.
+
+## Version 3.3.0 - Find the local server automatically
+
+### Features
+- **No `LOCAL_LLM_BASE_URL` needed for the common setups.** Without it, the server looks for
+  a running Ollama at `localhost:11434`, then llama-server at `localhost:8080`, and uses the
+  first that answers. The checks are strict (Ollama's version reply, or an OpenAI-style model
+  list), so an unrelated app on 8080 isn't mistaken for a model server. `LOCAL_LLM_BASE_URL`
+  still wins when set. Previously the default was `localhost:8080` only.
+- The server found is remembered until it stops answering; the next call then searches
+  again, so switching servers doesn't need a restart. A connection reset (a server stopped
+  while a kept-alive connection was open) now counts as unreachable, like a refused one.
+- When nothing answers, the error lists the addresses tried and says which of Ollama and
+  llama-server is installed (on `PATH`) but not running, with the command to start it.
+- `local_llm_server_info` reports `base_url_source` (`LOCAL_LLM_BASE_URL` or e.g.
+  `auto-detected Ollama`).
+- The Read-gate hook checks the same addresses when `LOCAL_LLM_BASE_URL` isn't set, so it
+  works with Ollama without configuration. Its path in `hooks.json` is now quoted (flagged by
+  `claude plugin validate`).
+
+### Tests
+- `test/discovery.test.js`: preference order, fallback, an unrelated server on a default
+  port, `LOCAL_LLM_BASE_URL` precedence, re-detection after the server goes away, the
+  "none found" message with and without an installed binary, and no caching of a failed
+  search. Verified live against Ollama 0.40.2 with no configuration.
+
+## Version 3.2.0 - Ollama backend
+
+### Features
+- **Ollama support through its native API.** The server probes `GET /api/version` once
+  (cached) and, if Ollama answers, sends chat through `POST /api/chat` instead of
+  `/v1/chat/completions`. `LOCAL_LLM_BACKEND=ollama|openai` skips the probe. The native API is
+  the only way to set a per-request context window: verified against Ollama 0.40.2, a prompt
+  larger than the window is cut down without any error (a 1024-token window kept 514 tokens of
+  a ~5k-token prompt). `MAX_TOKENS` is sent as `num_predict`.
+- **`LOCAL_LLM_MIN_CTX`** (default `32768`, `0` = never send `num_ctx`) is a minimum context
+  window, capped at the model's maximum: a larger window configured on the Ollama side (e.g.
+  `OLLAMA_CONTEXT_LENGTH=131072`) is kept rather than shrunk. Every call sends the model's
+  current window back as `num_ctx`, because Ollama reloads a model on any `num_ctx` change,
+  and also when `num_ctx` is omitted and the model was loaded with a non-default window (both
+  verified on 0.40.2). An unloaded model is first loaded with an empty `messages: []`
+  request, which loads it at the server default without generating, so its window can be read.
+- **Truncated-input warning (Ollama).** Since Ollama doesn't report dropped prompt tokens, a
+  response whose input came out at more than 8 characters per evaluated prompt token gets an
+  appended `[WARNING: the input didn't fit the model's N-token context window ...]` note. N is
+  the window the model ran at; when that's already the model's maximum, the advice is to send
+  less rather than to raise `LOCAL_LLM_MIN_CTX`.
+- **Ollama model detection.** Prefers the loaded model (`/api/ps`), then installed models
+  (`/api/tags`), rather than Ollama's `/v1/models`, which lists every installed model.
+  `resolveModel` now filters by reported capabilities: chat tools only pick `completion`
+  models, `local_llm_semantic_similarity` only `embedding` models, with an install hint when
+  there is none. Backends that don't report capabilities are unaffected.
+- **`LOCAL_LLM_CHAT_MODEL` / `LOCAL_LLM_EMBEDDING_MODEL`** pin the model for chat tools and
+  for `local_llm_semantic_similarity`, on any backend. They replace auto-detection for their
+  tools; a per-call `model` argument still wins. With several Ollama models installed,
+  auto-detection otherwise depends on what's loaded or most recently pulled.
+- **Auto-pull of configured models (Ollama).** A `LOCAL_LLM_CHAT_MODEL` /
+  `LOCAL_LLM_EMBEDDING_MODEL` that isn't installed is pulled via `/api/pull` on first use
+  (1-hour timeout, concurrent calls share one pull, untagged names match `:latest`). Never for
+  a per-call `model` argument, so the calling agent can't trigger downloads.
+  `LOCAL_LLM_AUTO_PULL=0` disables it.
+- Chat request errors now include the backend's own explanation from the response body, e.g.
+  `Request failed with status code 404 (model 'x' not found)`.
+- `TOOL_REASONING_OVERRIDES` is sent as Ollama's `think` flag with Ollama.
+- `local_llm_server_info` with Ollama reports `ollama_version`, the model chat tools would use,
+  `model_loaded`, the running `context_size` (`/api/ps`), the model's `max_context_size`
+  (`/api/show`, known even before it's loaded), and `min_context_size`. Both backends now
+  include a `backend` field.
+- `local_llm_tokenize` with Ollama returns an explicit "not supported" error instead of a 404.
+
+### Tests
+- `test/ollama.test.js` with `test/helpers/mockOllamaServer.js` (shaped after real Ollama
+  0.40.2 responses): detection and override, model selection by load state and capability,
+  native request shape (`num_ctx`, `num_predict`, `think`), context-window selection (keeping
+  a larger default, raising a smaller one, no reloads, capped at the model's maximum), both
+  truncation warnings, token
+  usage mapping, server info, tokenize, embeddings. Also verified by hand against a real
+  Ollama 0.40.2 with `llama3.2`.
+
+### Documentation
+- New "Using Ollama" README section; AGENTS.md architecture notes updated.
+- Credit the original project: this repository is a fork of
+  [Jadael/OllamaClaude](https://github.com/Jadael/OllamaClaude) (AGPL-3.0). Added a `NOTICE` file
+  with the attribution and the modification notice (what and since when), an "Origin and licence"
+  section in the README, and the original author in `package.json`.
 
 ## Version 3.1.4 - Qwen3 prompt overrides for plain-text output, plus test coverage
 

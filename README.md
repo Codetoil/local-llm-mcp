@@ -1,17 +1,17 @@
 # local-llm-mcp
 
-This MCP (Model Context Protocol) server bridges a local **OpenAI-compatible LLM
-server** — llama.cpp's `llama-server`, vLLM, LM Studio, or anything else that speaks the
-`/v1/chat/completions` API — to **any MCP-speaking coding agent** — Claude Code, Cursor,
+This MCP (Model Context Protocol) server bridges a local LLM server — **Ollama** (through its
+native API), or any **OpenAI-compatible** server such as llama.cpp's `llama-server`, vLLM, LM
+Studio, or anything else that speaks the `/v1/chat/completions` API — to **any MCP-speaking coding agent** — Claude Code, Cursor,
 Codex CLI, Cline, Windsurf, or your own MCP client — letting you delegate coding tasks to
 your local models to minimize cloud API token usage. It speaks standard MCP over stdio, so
 nothing here is Claude-specific; the setup instructions below use Claude Code as the
 reference example since that's what's included (`claude-mcp-config.json`), but the same
 `node index.js` command works as the MCP server entry for any client.
 
-`llama-server` is used as the worked example throughout this README since it's the only
-backend this project's test suite runs against — see "Using a Different Backend" below for
-pointing this server at vLLM, LM Studio, or anything else OpenAI-compatible instead.
+`llama-server` is used as the worked example throughout this README. See "Using Ollama"
+below for Ollama, and "Using a Different Backend" for vLLM, LM Studio, or anything else
+OpenAI-compatible. The test suite runs against mocked llama-server and Ollama backends.
 
 ## How It Works
 
@@ -50,26 +50,43 @@ These tools read files directly on the MCP server, dramatically reducing convers
     (capped at 50 matched files)
 11. **local_llm_generate_code_with_context** - Generate code using existing files as reference
     patterns. `context_files` also supports glob patterns, same as above
+12. **local_llm_review_diff** - Review git changes without the diff entering the agent's
+    context: the server runs `git diff` itself (read-only). Reviews uncommitted changes by
+    default, only staged ones with `staged: true`, or what a branch adds since `base` (like a
+    pull request: `git diff <base>...HEAD`), optionally limited to `paths`. Each line is
+    labelled with its line number in the new file, so findings cite real `file:line`
+    locations. See "Reviewing git changes" below
+13. **local_llm_digest_file** - Digest a long log or command output file (test run, build,
+    CI log): the outcome with the runner's own counts, each distinct failure with its line
+    numbers and exact message, and the likely cause. Redirect a command's output to a file
+    first (`npm test > /tmp/test.log 2>&1`). Color codes are stripped; logs over about 100k
+    characters keep their start and, mostly, their end, with a marker naming the skipped lines
 
 ### Introspection
 
-12. **local_llm_server_info** - Reports which model your backend currently has loaded, its
+14. **local_llm_server_info** - Reports which model your backend currently has loaded, its
     context size, slot count, and whether it has a chat template — useful for any agent to
     check what's actually running before assuming a model or capability. The context-size/
     slot/chat-template fields come from llama-server's `/props` extension and come back
-    `null` on backends that don't implement it (see "Using a Different Backend" below).
-13. **local_llm_session_stats** - Reports cumulative prompt/completion/total token usage sent
+    `null` on backends that don't implement it (see "Using a Different Backend" below). With
+    Ollama it reports the model chat tools would use, whether it's loaded, the largest
+    context window it supports (`max_context_size`, from `/api/show`), and the window it's
+    actually running at (`context_size`, from `/api/ps`; `null` until the model is loaded).
+    See "Using Ollama" below.
+15. **local_llm_session_stats** - Reports cumulative prompt/completion/total token usage sent
     to and received from your backend so far in this session, with a per-tool breakdown —
     based on the `usage` field the backend returns per request. Answers "how many tokens
-    have actually been offloaded to the local model instead of my own context?"
+    have actually been offloaded to the local model instead of my own context?" Also
+    reports `thinkingDecisions`: how often a decision model turned thinking on or off (see
+    "Thinking decisions" below)
 
 ### Primitives
 
-14. **local_llm_tokenize** - Counts how many tokens a piece of text would consume according to
+16. **local_llm_tokenize** - Counts how many tokens a piece of text would consume according to
     the currently loaded tokenizer, via `/tokenize` — a llama.cpp/llama-server extension, not
     a standard OpenAI endpoint. Useful for checking context-window fit before sending large
-    content.
-15. **local_llm_semantic_similarity** - Ranks candidate texts by semantic similarity to a query
+    content. Not available with Ollama, which has no tokenize endpoint.
+17. **local_llm_semantic_similarity** - Ranks candidate texts by semantic similarity to a query
     using the backend's `/v1/embeddings` endpoint (standard OpenAI surface, but requires an
     embeddings-capable model to be loaded — for llama-server, start it with `--embeddings`).
     Returns similarity scores only, never raw embedding vectors, since a 768-4096 float vector
@@ -131,12 +148,76 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/models
 ```
 
-By default this MCP server talks to `http://localhost:8080`. Override with the
-`LOCAL_LLM_BASE_URL` environment variable if you run `llama-server` on a different host/port:
+### Finding the server
+
+With no configuration, the server looks for a running local LLM server itself, in this order:
+
+1. **Ollama** at `http://localhost:11434` (it must answer `GET /api/version`)
+2. **llama-server** at `http://localhost:8080` (it must answer `GET /v1/models` with a model
+   list, so an unrelated app listening on 8080 isn't mistaken for it)
+
+The first one that answers is used, and remembered until it stops answering. The next call
+then searches again, so switching from one server to the other doesn't need a restart. If
+neither answers, the error names what was tried and which of the two is installed but not
+running, with the command that starts it. `local_llm_server_info` reports which server was
+used and how it was found (`base_url_source`).
+
+Set `LOCAL_LLM_BASE_URL` to skip the search, e.g. for a server on another host or port, or
+for vLLM and LM Studio:
 
 ```bash
 export LOCAL_LLM_BASE_URL=http://localhost:8081
 ```
+
+### Using Ollama
+
+Start Ollama (`ollama serve`, or `brew services start ollama`); the server finds it on its
+default port without any configuration (see "Finding the server" above). With
+`LOCAL_LLM_BASE_URL` set to an Ollama address instead, the server recognizes Ollama by
+probing `GET /api/version`, which OpenAI-compatible servers don't have. Set `LOCAL_LLM_BACKEND=ollama` or
+`LOCAL_LLM_BACKEND=openai` to skip the probe and force either path. With Ollama:
+
+- **Chat goes through the native `POST /api/chat`**, not Ollama's `/v1` compatibility layer,
+  because only the native API lets each request set its context window. Ollama otherwise
+  runs a model at its own default window and **silently drops whatever part of the prompt
+  doesn't fit**, which is exactly the file contents the file-aware tools send.
+- **`LOCAL_LLM_MIN_CTX`** (default `32768`) is the *minimum* window. If your Ollama already
+  runs models with a larger window, for example via `OLLAMA_CONTEXT_LENGTH=131072`, that
+  window is kept. Only a smaller window (Ollama's stock default, or one another client
+  loaded the model with) is raised to the minimum, capped at the model's own maximum. To
+  avoid reloads, every call sends the model's current window back as `num_ctx`: Ollama
+  reloads a model whenever a request's `num_ctx` differs from its running window, and a
+  request *without* `num_ctx` means "the default", which reloads it too. A model that isn't
+  loaded yet is first loaded with an empty request, at your Ollama default, so its window
+  can be read from `/api/ps`. Set `LOCAL_LLM_MIN_CTX=0` to never send `num_ctx` at all.
+- **If a prompt still didn't fit**, the tool's answer gets an appended
+  `[WARNING: the input didn't fit the model's N-token context window ...]` note. Ollama
+  doesn't report truncation itself, so this is inferred from how few prompt tokens it
+  evaluated compared to the size of the input. N is the window the model actually ran at,
+  read back from `/api/ps`. If that's already the model's maximum, the warning says to send
+  less rather than to raise `LOCAL_LLM_MIN_CTX`.
+  `local_llm_server_info` shows both numbers for the current model.
+- **Model auto-detection** prefers the model Ollama currently has loaded (`/api/ps`), then
+  falls back to installed models (`/api/tags`), which Ollama loads on demand. Ollama's
+  `/v1/models` isn't used for this because it lists every installed model, loaded or not.
+  Chat tools only pick models with the `completion` capability, and
+  `local_llm_semantic_similarity` only picks ones with `embedding` (e.g.
+  `ollama pull nomic-embed-text`).
+- **`TOOL_REASONING_OVERRIDES`** maps to Ollama's own `think` flag instead of
+  `chat_template_kwargs`, so it works for every Ollama thinking model, not just Qwen3.
+  Ollama returns reasoning separately from the answer, so no extra server flag is needed.
+- **`local_llm_tokenize`** isn't available, since Ollama has no tokenize endpoint; it returns
+  an error that says so.
+
+**Server-side settings with Homebrew (macOS).** Ollama's own settings, such as its default
+context window (`OLLAMA_CONTEXT_LENGTH`), are environment variables of the Ollama service,
+not of this MCP server. With `brew services`, they live in the service's launchd plist
+(`~/Library/LaunchAgents/sh.brew.ollama.plist`), and Homebrew regenerates that file on some
+service operations and upgrades. `scripts/ollama-patch-env.sh` writes the variables listed at
+its top into the plist and reloads the service, and does nothing when they're already set,
+so it's safe to re-run after an upgrade. Edit its `VARS` list first; it ships with
+`OLLAMA_KEEP_ALIVE=15m`, `OLLAMA_CONTEXT_LENGTH=131072`, `OLLAMA_FLASH_ATTENTION=1` and
+`OLLAMA_KV_CACHE_TYPE=q8_0`.
 
 ### Using a Different Backend (vLLM, LM Studio, etc.)
 
@@ -170,7 +251,7 @@ against any backend that implements standard OpenAI chat completions.
 ### Embed-Only Mode (pointing at an embedding model)
 
 An embedding model (`nomic-embed-text`, `bge-*`, `e5-*`, …) serves `/v1/embeddings` and
-`/tokenize` but has no chat-completion endpoint and usually no chat template, so the twelve
+`/tokenize` but has no chat-completion endpoint and usually no chat template, so the fourteen
 chat-backed tools can only ever fail against it. Set `LOCAL_LLM_EMBED_ONLY` to register just
 the three tools such a backend can actually serve:
 
@@ -188,7 +269,7 @@ With it set:
 - `local_llm_server_info` reports `embed_only: true`.
 
 This matters most when one agent has several of these servers configured at once: without
-the flag, an embeddings backend contributes twelve tools that look identical to the
+the flag, an embeddings backend contributes fourteen tools that look identical to the
 generative server's and fail on use. Run two entries, each with its own `LOCAL_LLM_BASE_URL`:
 
 ```json
@@ -277,8 +358,26 @@ server can't run from the plugin's own bundled source), and additionally install
 reading whole files by hand. The hook only activates when a local LLM server is actually
 reachable (it fails open otherwise), and only blocks the *first* `Read` of a given file per
 session — a second `Read` on the same path goes through, so it doesn't fight the `Edit` tool's
-own read-before-edit requirement. This is Claude-Code-specific plumbing on top of the
-provider-agnostic core above; every other MCP client should keep using Option A or B.
+own read-before-edit requirement.
+
+It also installs a **`UserPromptSubmit` hook** that points Claude at the right tool when a
+prompt asks for what the local model is good at. Claude Code loads MCP tools as deferred
+names, which Claude rarely reaches for unprompted; the hook adds one line to its context
+instead, e.g. *"local-llm: for long command output, redirect it to a file … and call
+local_llm_digest_file on it"*. It recognizes requests to review git changes
+(`local_llm_review_diff`), test, build or CI output and logs (`local_llm_digest_file`), file
+reviews (`local_llm_review_file`), explanations (`local_llm_explain_file`) and cross-file
+questions (`local_llm_analyze_files`). It matches the prompt's words first, so most prompts
+cost no network call, and only adds the line when a local LLM server answers (about 40 ms on
+a match). Both hooks share their server check (`hooks/local-llm-common.sh`) and need `jq` and
+`curl`.
+
+This is Claude-Code-specific plumbing on top of the provider-agnostic core above; every other
+MCP client should keep using Option A or B. For a stronger steer in Claude Code without the
+plugin, or on top of it, add a few lines to your `CLAUDE.md` saying when to offload, e.g.
+reviews and explanations of larger files, test or build logs (via `local_llm_digest_file`) and
+diffs you didn't write (via `local_llm_review_diff`), but not small files or files you're about
+to edit.
 
 ### 4. Restart Your MCP Client
 
@@ -308,9 +407,42 @@ Simply ask the agent to do tasks, and it will decide when to delegate to the loc
 
 There's no hardcoded model anymore. Every tool call auto-detects whichever model your
 backend currently has loaded (via `GET /v1/models`, standard across OpenAI-compatible
-servers, cached for ~30 seconds), so switching models is just a matter of restarting the
+servers, or `/api/ps` and `/api/tags` with Ollama; cached for ~30 seconds), so switching models is just a matter of restarting the
 backend with a different model loaded (e.g. `llama-server`'s `-m` flag). You can still
 force a specific model per call by passing an explicit `model` argument to any tool.
+
+**Pinning a model.** Set `LOCAL_LLM_CHAT_MODEL` to the model the 14 chat tools should use,
+and `LOCAL_LLM_EMBEDDING_MODEL` to the one for `local_llm_semantic_similarity`. Either one
+replaces auto-detection entirely for its tools, so the choice no longer depends on what
+happens to be loaded or most recently pulled. This matters most with Ollama, where several
+models are typically installed. A per-call `model` argument still wins. An unknown name
+fails with the backend's own message, e.g. `(model 'gemma4:e4b-typo' not found)`.
+
+With Ollama, a configured model that isn't installed yet is **pulled automatically** on
+first use (`POST /api/pull`), so the first call may take as long as the download.
+Concurrent calls share one pull, and a name that can't be pulled fails with Ollama's reason
+(e.g. `pull model manifest: file does not exist`). This only applies to these two settings,
+never to a `model` argument passed by the calling agent, so an agent can't start downloads
+on its own. `LOCAL_LLM_AUTO_PULL=0` turns it off. Set them in the `env` of your MCP client
+config:
+
+```json
+{
+  "mcpServers": {
+    "local_llm": {
+      "command": "npx",
+      "args": ["-y", "github:hlgr360/local-llm-mcp"],
+      "env": {
+        "LOCAL_LLM_CHAT_MODEL": "gemma4:e4b-mlx",
+        "LOCAL_LLM_EMBEDDING_MODEL": "nomic-embed-text"
+      }
+    }
+  }
+}
+```
+
+Order of precedence: per-call `model` argument, then `LOCAL_LLM_CHAT_MODEL` /
+`LOCAL_LLM_EMBEDDING_MODEL`, then `TOOL_MODEL_PREFERENCES` (below), then auto-detection.
 
 **Router/multi-model setups** (e.g. `llama-swap` fronting several models): when
 `/v1/models` reports more than one entry, auto-detection consults `TOOL_MODEL_PREFERENCES`
@@ -389,6 +521,53 @@ export const TOOL_REASONING_OVERRIDES = {
 };
 ```
 
+With Ollama the override is sent as Ollama's own `think` flag instead, which works for any
+Ollama thinking model.
+
+### Thinking decisions (Ollama, with a decision model)
+
+A fixed setting per tool can't tell an easy request from a hard one: `fix_code` for a typo
+and for a race condition get the same treatment. With Ollama, a small **decision model**
+such as [Laya](https://ollama.com/library/laya) can choose per request instead. Before each
+chat call, the server asks it whether the request needs low or high reasoning and sends
+`think: false` or `think: true` to the chat model.
+
+- **On automatically** when a model with Ollama's `decision` capability is installed and the
+  chat model has the `thinking` capability: `ollama pull laya`, nothing else to configure.
+  Without a decision model, or with a chat model that can't think, nothing changes.
+- **`LOCAL_LLM_DECISION_MODEL`** picks a specific one (pulled automatically if missing, like
+  the other configured models), e.g. `laya:421m-typed-decisions-mlx-fp16`; `off` disables
+  thinking decisions. Without the setting, an installed decision model is used but never
+  pulled.
+- **Only confident answers count**: below 0.65 probability, or if the decision model fails
+  for any reason, the chat model keeps its own default. A `TOOL_REASONING_OVERRIDES` entry
+  always wins.
+- **What the decision model sees**: the tool's one-line task (e.g. "Review these code changes
+  for bugs, regressions and risky changes."), the agent's own instruction text and the
+  number of code lines. Never the code itself, which wouldn't fit its 512-1024-token input
+  anyway.
+- `local_llm_session_stats` reports the decisions under `thinkingDecisions`.
+
+Measured with Laya and `gemma4:e4b-mlx` on an M4: about 150 ms per decision. It chose low
+for writing `is_even` (answered in 2.3s without thinking) and high for fixing a race
+condition (26s with thinking). On 8 clear-cut test requests it picked the expected level 8
+times out of 8; borderline requests are where it will be wrong, which is why low-confidence
+answers are ignored.
+
+### Reviewing git changes
+
+`local_llm_review_diff` is for changes the agent didn't write or no longer has in view: a
+branch against `main`, a checked-out pull request, or a long session's uncommitted work.
+For edits the agent just made, it already knows the changes. The local model's review is a
+cheap first pass, not a final verdict: expect some false alarms.
+
+It only ever runs `git diff` (and its `--name-only` form), without a shell. Because `git
+diff` has options that write files (`--output=<file>`), a `base` must look like a git ref
+and can't start with `-`, and `paths` are passed after `--`, where git treats them as paths.
+A repository's own configuration can't make it run programs either: external diff drivers
+and textconv filters are skipped (`--no-ext-diff`, `--no-textconv`) and fsmonitor is
+switched off. Untracked files aren't part of `git diff`; `git add -N <file>` includes them.
+
 ### CodeGraph Context Enrichment (optional)
 
 If the project being reviewed has a CodeGraph index (`.codegraph/` directory present, from
@@ -417,9 +596,12 @@ Add new tools by:
 
 ### "Cannot connect to local LLM server" Error
 - Ensure your backend is running, e.g. `llama-server -m <model.gguf> --jinja --port 8080`
-- Check it's on the expected port: `curl http://localhost:8080/health` (or your backend's
-  equivalent health/models endpoint)
-- Confirm `LOCAL_LLM_BASE_URL` (if set) matches where your backend is actually listening
+  or `ollama serve`
+- Without `LOCAL_LLM_BASE_URL`, only the default addresses are searched: Ollama on 11434 and
+  llama-server on 8080 (see "Finding the server"). The error says which of them is installed
+  but not running. Check with `curl http://localhost:11434/api/version` or
+  `curl http://localhost:8080/v1/models`
+- If `LOCAL_LLM_BASE_URL` is set, confirm it matches where your backend is actually listening
 
 ### Tools Not Appearing in Your MCP Client
 - Verify the config path is correct
@@ -449,6 +631,13 @@ Add new tools by:
 4. **Local model analyzes**: Reviews the file
 5. **Agent refines**: Adds context or additional insights
 6. **Token savings**: ~98.75% compared to reading the file into conversation first
+
+### Test Failure Workflow
+1. **Agent runs**: `npm test > /tmp/test.log 2>&1` instead of reading the output directly
+2. **Agent calls**: `local_llm_digest_file` with `/tmp/test.log`
+3. **Local model**: reports e.g. "tests 3, pass 1, fail 1, cancelled 1" and each failure
+   with its line numbers
+4. **Agent reads**: only those lines of the log, if it needs more
 
 ### Multi-File Analysis Workflow
 1. **User asks**: "How do index.js and package.json relate?"
@@ -489,21 +678,37 @@ Response time depends on:
 local-llm-mcp/
 ├── index.js              # Main MCP server implementation
 ├── prompts.js            # Prompt registry, indexed by model family
-├── test/                 # Automated test suite (npm test) — mocked llama-server backend
+├── test/                 # Automated test suite (npm test) — mocked llama-server and Ollama backends
 │   ├── helpers/mockLlamaServer.js
+│   ├── helpers/mockOllamaServer.js
 │   ├── prompts.test.js
 │   ├── server.test.js
+│   ├── ollama.test.js
+│   ├── discovery.test.js
+│   ├── review-diff.test.js
+│   ├── hooks.test.js
 │   ├── server-unreachable.test.js
 │   └── integration.test.js
 ├── scripts/
-│   └── start-llama.sh    # Optional convenience launcher for llama-server (tmux + HF model lookup)
+│   ├── start-llama.sh    # Optional convenience launcher for llama-server (tmux + HF model lookup)
+│   └── ollama-patch-env.sh  # Sets Ollama's server env vars in its Homebrew launchd plist and reloads it
 ├── eslint.config.js      # ESLint flat config (recommended rules only, no style/formatting)
 ├── package.json          # Node.js dependencies
 ├── README.md             # This file
+├── NOTICE                # Attribution to the original project and the modification notice
 ├── AGENTS.md             # Priming notes for coding agents working in this repo
 ├── TEST.md               # Manual test cases and validation guide
 └── .gitignore             # Git ignore patterns
 ```
+
+## Origin and licence
+
+This project began as a fork of [Jadael/OllamaClaude](https://github.com/Jadael/OllamaClaude),
+an MCP server that lets Claude Code use a local Ollama server, and has been substantially
+modified since 2026-08-18 (among other things it now targets any OpenAI-compatible server
+and any MCP-speaking coding agent). Like the original it is licensed under the
+[GNU Affero General Public License v3.0](LICENSE). See [NOTICE](NOTICE) for the attribution and
+the modification notice, and [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 ## Contributing & Future Improvements
 

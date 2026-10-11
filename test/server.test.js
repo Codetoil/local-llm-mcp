@@ -109,6 +109,52 @@ describe("resolveModel with multiple models (router/multi-model support)", () =>
   });
 });
 
+describe("resolveModel with LOCAL_LLM_CHAT_MODEL / LOCAL_LLM_EMBEDDING_MODEL", () => {
+  afterEach(() => {
+    delete process.env.LOCAL_LLM_CHAT_MODEL;
+    delete process.env.LOCAL_LLM_EMBEDDING_MODEL;
+    delete TOOL_MODEL_PREFERENCES.write_tests;
+  });
+
+  test("LOCAL_LLM_CHAT_MODEL wins over the loaded model and preferences, without querying /v1/models", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    mock.state.modelIds = ["deepseek-coder-v2", "qwen2.5-coder"];
+    TOOL_MODEL_PREFERENCES.write_tests = ["qwen"];
+    const server = new LocalLlmServer();
+    const resolved = await server.resolveModel(undefined, "write_tests");
+    assert.deepEqual(resolved, { id: "gemma-3-4b-it", family: "gemma" });
+    assert.equal(mock.state.requests.filter((r) => r.url === "/v1/models").length, 0);
+  });
+
+  test("an explicit model argument still wins over LOCAL_LLM_CHAT_MODEL", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    const server = new LocalLlmServer();
+    const resolved = await server.resolveModel("qwen-explicit", "generate_code");
+    assert.equal(resolved.id, "qwen-explicit");
+  });
+
+  test("LOCAL_LLM_EMBEDDING_MODEL is used for semantic_similarity only", async () => {
+    process.env.LOCAL_LLM_EMBEDDING_MODEL = "nomic-embed-text";
+    const server = new LocalLlmServer();
+    assert.equal((await server.resolveModel(undefined, "semantic_similarity")).id, "nomic-embed-text");
+    assert.equal((await server.resolveModel(undefined, "generate_code")).id, "mock-org/mock-model-7b");
+  });
+
+  test("LOCAL_LLM_CHAT_MODEL isn't used for semantic_similarity", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    const server = new LocalLlmServer();
+    assert.equal((await server.resolveModel(undefined, "semantic_similarity")).id, "mock-org/mock-model-7b");
+  });
+
+  test("the configured chat model is what's actually sent", async () => {
+    process.env.LOCAL_LLM_CHAT_MODEL = "gemma-3-4b-it";
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "x", language: "python" });
+    const chatRequest = mock.state.requests.find((r) => r.url === "/v1/chat/completions");
+    assert.equal(chatRequest.body.model, "gemma-3-4b-it");
+  });
+});
+
 describe("callLocalLlm / tool methods", () => {
   test("generateCode sends the built messages and returns the model's content", async () => {
     const server = new LocalLlmServer();
@@ -325,6 +371,62 @@ describe("callLocalLlm / tool methods", () => {
   });
 });
 
+describe("digestFile", () => {
+  const lastPrompt = () =>
+    mock.state.requests.filter((r) => r.url === "/v1/chat/completions").at(-1).body.messages[1].content;
+
+  test("sends the whole log line-numbered, with the question and file details", async () => {
+    const logPath = path.join(tmpDir, "test.log");
+    await fs.writeFile(logPath, "running 3 tests\nok 1\nnot ok 2 - adds numbers\nok 3\n");
+    const server = new LocalLlmServer();
+    await server.digestFile({ file_path: logPath, question: "which test failed?" });
+    const prompt = lastPrompt();
+    assert.match(prompt, /^QUESTION: which test failed\?/);
+    assert.match(prompt, /FILE: test\.log\nPATH: .*test\.log\nLINES: 5\n/);
+    assert.match(prompt, /^3\tnot ok 2 - adds numbers$/m);
+    assert.doesNotMatch(prompt, /omitted/);
+  });
+
+  test("strips terminal color codes", async () => {
+    const logPath = path.join(tmpDir, "color.log");
+    await fs.writeFile(logPath, "\x1b[31mFAIL\x1b[0m test/a.test.js\n\x1b[2K\x1b[1Gdone\n");
+    const server = new LocalLlmServer();
+    await server.digestFile({ file_path: logPath });
+    const prompt = lastPrompt();
+    assert.match(prompt, /^1\tFAIL test\/a\.test\.js$/m);
+    assert.match(prompt, /^2\tdone$/m);
+    assert.ok(!prompt.includes("\x1b"), "escape codes left in the prompt");
+  });
+
+  test("a log over the budget keeps its start and end, with original line numbers and a marker", async () => {
+    const logPath = path.join(tmpDir, "huge.log");
+    const lines = Array.from({ length: 20000 }, (_, i) => `line ${i + 1}: progress output that nobody needs to read`);
+    lines[0] = "line 1: START of the run";
+    lines[19999] = "line 20000: 1 test FAILED";
+    await fs.writeFile(logPath, lines.join("\n"));
+    const server = new LocalLlmServer();
+    await server.digestFile({ file_path: logPath });
+    const prompt = lastPrompt();
+    assert.ok(prompt.length < 101_000, `prompt is ${prompt.length} chars`);
+    assert.match(prompt, /^1\tline 1: START of the run$/m);
+    assert.match(prompt, /^20000\tline 20000: 1 test FAILED$/m);
+    const marker = /\[\.\.\. lines (\d+)-(\d+) omitted \((\d+) lines\) \.\.\.\]/.exec(prompt);
+    assert.ok(marker, "expected an omitted-lines marker");
+    const [, from, to, count] = marker.map(Number);
+    assert.equal(count, to - from + 1);
+    assert.match(prompt, new RegExp(`^${from - 1}\\t`, "m")); // last head line is right before the gap
+    assert.match(prompt, new RegExp(`^${to + 1}\\t`, "m")); // first tail line is right after it
+    assert.match(prompt, new RegExp(`LINES: 20000 \\(lines ${from}-${to} omitted to fit`));
+    // Most of the budget goes to the end, where failures usually are.
+    assert.ok(20000 - to > from * 3, `head ${from - 1} lines, tail ${20000 - to} lines`);
+  });
+
+  test("a missing file is a clear error", async () => {
+    const server = new LocalLlmServer();
+    await assert.rejects(() => server.digestFile({ file_path: path.join(tmpDir, "nope.log") }), /Failed to read file .*nope\.log/);
+  });
+});
+
 describe("serverInfo", () => {
   test("merges /props and /v1/models into one report", async () => {
     mock.state.modelId = "qwen-2.5-coder-7b";
@@ -367,7 +469,14 @@ describe("sessionStats", () => {
   test("starts at zero before any calls", () => {
     const server = new LocalLlmServer();
     const stats = JSON.parse(server.sessionStats().content[0].text);
-    assert.deepEqual(stats, { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, perTool: {} });
+    assert.deepEqual(stats, {
+      calls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      perTool: {},
+      thinkingDecisions: { model: null, decided: 0, thinkOn: 0, thinkOff: 0, unsure: 0, failed: 0 },
+    });
   });
 
   test("accumulates usage across calls, with a per-tool breakdown", async () => {

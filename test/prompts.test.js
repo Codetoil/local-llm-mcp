@@ -80,6 +80,20 @@ describe("FAMILY_OVERRIDES.qwen", () => {
     explain_file: { code: "1\tconst x = 1;", fileName: "a.js", filePath: "/tmp/a.js" },
     analyze_files: { task: "find dependencies", filesContent: "FILE: a.js\n1\tconst x = 1;" },
     general_task: { task: "summarize this" },
+    digest_file: {
+      content: "1\tFAIL test/a.test.js",
+      question: "why did it fail?",
+      fileName: "test.log",
+      filePath: "/tmp/test.log",
+      totalLines: 1,
+      omitted: null,
+    },
+    review_diff: {
+      diff: "     1 +const x = 1;",
+      changedFiles: ["a.js"],
+      description: "uncommitted changes (staged and unstaged)",
+      focus: "bugs",
+    },
   };
 
   for (const tool of Object.keys(FAMILY_OVERRIDES.qwen)) {
