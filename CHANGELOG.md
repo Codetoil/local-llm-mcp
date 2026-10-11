@@ -1,8 +1,20 @@
 # Changelog
 
-## Unreleased
+## Version 3.5.0 - Prompt hook that points Claude at the right tool
 
 ### Added
+- **`UserPromptSubmit` hook** (`hooks/local-llm-prompt-nudge.sh`, Claude Code plugin): when a
+  prompt asks to review git changes, look into test/build/CI output or logs, review or explain
+  a file, or relate several files, it adds one line to Claude's context naming the matching
+  `local_llm_*` tool and noting that it's a deferred MCP tool. Claude Code loads MCP tools as
+  deferred names, and on a fresh install Claude rarely used them unprompted. Words are matched
+  first, so most prompts cost no network call; a hint is only added when a local LLM server
+  answers (~40 ms on a match against a real Ollama). Silent otherwise.
+- `hooks/local-llm-common.sh`: the server check, now shared by both hooks.
+- `test/hooks.test.js`: both hooks run as real processes (23 tests), including the Read gate,
+  which had no tests before.
+
+### Added (scripts)
 - `scripts/ollama-patch-env.sh`: sets Ollama's server-side environment variables (e.g.
   `OLLAMA_CONTEXT_LENGTH`) in the Homebrew launchd plist and reloads the service; a no-op when
   they're already set. Described in the README's "Using Ollama" section.
