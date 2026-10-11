@@ -79,6 +79,14 @@ const SAFE_GIT_REF = /^[A-Za-z0-9_./@{}~^][A-Za-z0-9_./@{}~^-]*$/;
 // skipped by the diff flags.
 const GIT_SAFE_CONFIG = ["-c", "core.fsmonitor=false"];
 const GIT_DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv"];
+// How much of a log digest_file sends: about 30k tokens of typical log text, which fits the
+// 32k minimum window with room for the answer. Longer logs keep their start and, mostly, their
+// end, where test runners and builds print failures and summaries.
+const DIGEST_CHAR_BUDGET = 100_000;
+const DIGEST_HEAD_SHARE = 0.2;
+// Terminal color and cursor codes, which logs captured from a TTY are full of.
+// eslint-disable-next-line no-control-regex -- matching the ESC character is the point
+const ANSI_ESCAPES = /\x1b\[[0-9;?]*[A-Za-z]/g;
 const GLOB_METACHARACTERS = /[*?[{]/;
 const MAX_GLOB_MATCHES = 50;
 const CODEGRAPH_CONTEXT_CHAR_LIMIT = 4000;
@@ -86,7 +94,9 @@ const CODEGRAPH_TIMEOUT_MS = 5000;
 
 const SERVER_INSTRUCTIONS = `Offloads code-shaped work (generation, review, refactoring, explanation, test-writing) to a local LLM, saving your own context budget.
 
-For anything already on disk, prefer the file-aware tools (local_llm_review_file, local_llm_explain_file, local_llm_analyze_files, local_llm_generate_code_with_context) over reading the file yourself and pasting it into the string-based tools -- the file-aware tools read server-side, at roughly 50 tokens of your context versus thousands for a full read. local_llm_analyze_files also works well for cross-file consistency checks (e.g. "do these docs agree with each other"), not just dependency/relationship analysis.
+For anything already on disk, prefer the file-aware tools (local_llm_review_file, local_llm_explain_file, local_llm_analyze_files, local_llm_generate_code_with_context, local_llm_digest_file, local_llm_review_diff) over reading the file yourself and pasting it into the string-based tools -- the file-aware tools read server-side, at roughly 50 tokens of your context versus thousands for a full read. local_llm_analyze_files also works well for cross-file consistency checks (e.g. "do these docs agree with each other"), not just dependency/relationship analysis.
+
+For commands with long output (test suites, builds, CI logs), redirect the output to a file (e.g. \`npm test > /tmp/test.log 2>&1\`) and call local_llm_digest_file on it instead of reading the output yourself; it reports the failures with line numbers, so you can then read just those lines. To review git changes you didn't write or no longer have in view (a branch against main, a checked-out PR, a long session's uncommitted work), use local_llm_review_diff; it runs git diff itself.
 
 This server has no internet access and no knowledge of anything outside the files you point it at. Don't use it for questions needing current external knowledge (library APIs, changelogs, GitHub issues, current docs) -- it will confabulate specifics rather than refuse. Verify its output before trusting it, the same way you would a fast but occasionally-wrong reviewer.`;
 
@@ -100,6 +110,40 @@ const MODEL_ARG_SCHEMA = {
 // away while a kept-alive connection to it was still open.
 function isUnreachable(error) {
   return error.code === "ECONNREFUSED" || error.code === "ECONNRESET";
+}
+
+// The part of a log that digest_file sends, line-numbered with the original line numbers. Fits
+// DIGEST_CHAR_BUDGET by keeping whole lines from the start (DIGEST_HEAD_SHARE of the budget) and
+// the end (the rest), with a marker naming the lines left out in between.
+function digestContent(raw) {
+  const content = raw.replace(ANSI_ESCAPES, "");
+  const lines = content.split("\n");
+  const numbered = (from, to) => lines.slice(from, to).map((line, i) => `${from + i + 1}\t${line}`);
+  if (content.length <= DIGEST_CHAR_BUDGET) {
+    return { text: numbered(0, lines.length).join("\n"), totalLines: lines.length, omitted: null };
+  }
+
+  // Counts each line as sent: its line-number prefix, the line and its newline.
+  const take = (budget, indices) => {
+    let used = 0;
+    let count = 0;
+    for (const index of indices) {
+      used += String(index + 1).length + 1 + lines[index].length + 1;
+      if (used > budget) break;
+      count += 1;
+    }
+    return count;
+  };
+  const headCount = take(DIGEST_CHAR_BUDGET * DIGEST_HEAD_SHARE, lines.keys());
+  const tailIndices = Array.from({ length: lines.length - headCount }, (_, i) => lines.length - 1 - i);
+  const tailCount = take(DIGEST_CHAR_BUDGET * (1 - DIGEST_HEAD_SHARE), tailIndices);
+  const omitted = { from: headCount + 1, to: lines.length - tailCount };
+  const marker = `[... lines ${omitted.from}-${omitted.to} omitted (${omitted.to - omitted.from + 1} lines) ...]`;
+  return {
+    text: [...numbered(0, headCount), marker, ...numbered(lines.length - tailCount, lines.length)].join("\n"),
+    totalLines: lines.length,
+    omitted,
+  };
 }
 
 // Prefixes every line of a unified diff that exists in the new version of a file (context and
@@ -501,6 +545,25 @@ class LocalLlmServer {
           },
         },
         {
+          name: "local_llm_digest_file",
+          description: "Digest a long log or command output file (test run, build, CI log, stack traces) with your local LLM server: it reports the outcome, each distinct error or failure with its line numbers and exact message, and the likely cause, instead of you reading thousands of lines. Redirect a command's output to a file first (e.g. `npm test > /tmp/test.log 2>&1`). Very long files are cut to their start and end, where failures and summaries usually are.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              file_path: {
+                type: "string",
+                description: "Absolute path to the log or output file",
+              },
+              question: {
+                type: "string",
+                description: "What to look for, if more specific than errors and failures (e.g. \"why did the integration tests time out?\")",
+              },
+              model: MODEL_ARG_SCHEMA,
+            },
+            required: ["file_path"],
+          },
+        },
+        {
           name: "local_llm_review_diff",
           description: "Review git changes with your local LLM server. The server runs `git diff` itself (read-only) and reviews the result, so the diff never enters your context. Use it for changes you didn't write or no longer have in view: a branch against main, a checked-out PR, or a long session's uncommitted work before committing. Findings cite file:line in the new version. Untracked files aren't included.",
           inputSchema: {
@@ -620,6 +683,8 @@ class LocalLlmServer {
             return await this.generateCodeWithContext(args);
           case "local_llm_review_diff":
             return await this.reviewDiff(args);
+          case "local_llm_digest_file":
+            return await this.digestFile(args);
           case "local_llm_server_info":
             return await this.serverInfo();
           case "local_llm_session_stats":
@@ -1267,6 +1332,22 @@ class LocalLlmServer {
       language,
       contextSection,
       codeGraphContext,
+      model,
+    });
+    return { content: [{ type: "text", text: response }] };
+  }
+
+  async digestFile(args) {
+    const { file_path, question, model } = args;
+    const raw = await this.readFile(file_path);
+    const { text, totalLines, omitted } = digestContent(raw);
+    const response = await this.callLocalLlm("digest_file", {
+      content: text,
+      question,
+      fileName: path.basename(file_path),
+      filePath: file_path,
+      totalLines,
+      omitted,
       model,
     });
     return { content: [{ type: "text", text: response }] };
