@@ -18,12 +18,12 @@ templates, indexed by tool and by detected model family.
 npm install     # install deps (@modelcontextprotocol/sdk, axios) + devDeps (eslint)
 npm test        # run the automated suite (node --test) — mocked backends, ~1.5s, no real server needed
 npm run lint    # ESLint (flat config, recommended rules only — no style/formatting rules)
-npm start        # run the MCP server on stdio (needs a real llama-server on LOCAL_LLM_BASE_URL)
+npm start        # run the MCP server on stdio (needs a real Ollama or llama-server, found automatically)
 node --check index.js && node --check prompts.js   # quick syntax check
 ```
 
-Running against a **real** `llama-server` requires it to already be up (default
-`http://localhost:8080`, override via `LOCAL_LLM_BASE_URL`). `npm test` does not need this —
+Running against a **real** server requires it to already be up: Ollama on 11434 or
+llama-server on 8080 are found automatically, anything else via `LOCAL_LLM_BASE_URL`. `npm test` does not need this —
 `test/helpers/mockLlamaServer.js` stands in for it (and `test/helpers/mockOllamaServer.js`
 for Ollama).
 
@@ -50,9 +50,17 @@ for Ollama).
   faster (28s → 541ms) for a trivial `generate_code` call with thinking disabled. Not a
   standard OpenAI field; it's Qwen3-specific and silently ignored by templates that don't
   recognize it.
-  **Two backends.** `detectBackend()` probes `GET /api/version` once per instance (cached;
-  `LOCAL_LLM_BACKEND=ollama|openai` skips it) — Ollama answers, OpenAI-compatible servers
-  404. With Ollama, `callLocalLlm` goes through `ollamaChat` (native `POST /api/chat`) instead
+  **Finding the server.** `locateServer()` returns `{ url, backend, source }`, cached per
+  instance: `LOCAL_LLM_BASE_URL` if set (backend via `probeBackend`: `GET /api/version`,
+  Ollama answers, OpenAI-compatible servers 404; `LOCAL_LLM_BACKEND=ollama|openai` skips
+  it), otherwise the first of `DEFAULT_SERVERS` (Ollama :11434, then llama-server :8080)
+  that `isServerAt` confirms. Every request builds its URL from `await this.serverUrl()`.
+  `connectionError()` (for `isUnreachable`: ECONNREFUSED or ECONNRESET) forgets the cached
+  server so the next call searches again; the "none found" error is marked ECONNREFUSED
+  plus `noServerFound` so those catch blocks pass it through unwrapped. Tests replace
+  `server.defaultServers` with mock URLs (`test/discovery.test.js`) and never touch the real
+  default ports.
+  **Two backends.** With Ollama, `callLocalLlm` goes through `ollamaChat` (native `POST /api/chat`) instead
   of `openAiChat` (`/v1/chat/completions`), because only the native API takes a per-request
   `num_ctx` — without it Ollama silently drops prompt that doesn't fit its default window.
   `ollamaContextWindow` picks it: the model's current window, raised to `LOCAL_LLM_MIN_CTX`
@@ -109,9 +117,9 @@ for Ollama).
 
 - Single 15-minute request timeout (`callLocalLlm`), intentionally generous for slow local
   hardware — don't "fix" this down without checking `TEST.md`'s timing notes.
-- `LOCAL_LLM_BASE_URL` (and `LOCAL_LLM_MIN_CTX`) is read once at module import time as a top-level constant; it can't
-  be changed per-instance at runtime. Tests that need a fresh backend URL do so in their
-  own file/process (see `test/server-unreachable.test.js`).
+- `LOCAL_LLM_MIN_CTX` is read once at module import time as a top-level constant.
+  `LOCAL_LLM_BASE_URL` is read per lookup, but the result is cached per instance; the test
+  files that each need their own mock still run in their own file/process.
 - `index.js`'s shebang line, its `bin` entry in `package.json`, and the
   `import.meta.url === file://${realpathSync(process.argv[1])}` auto-start guard are all
   load-bearing for `npx github:hlgr360/local-llm-mcp` to work (the npm registry package

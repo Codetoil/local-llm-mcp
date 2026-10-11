@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/local-llm-read-gate.sh",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/local-llm-read-gate.sh\"",
             "timeout": 5
           }
         ]

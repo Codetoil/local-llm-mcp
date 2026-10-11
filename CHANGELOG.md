@@ -1,5 +1,30 @@
 # Changelog
 
+## Version 3.3.0 - Find the local server automatically
+
+### Features
+- **No `LOCAL_LLM_BASE_URL` needed for the common setups.** Without it, the server looks for
+  a running Ollama at `localhost:11434`, then llama-server at `localhost:8080`, and uses the
+  first that answers. The checks are strict (Ollama's version reply, or an OpenAI-style model
+  list), so an unrelated app on 8080 isn't mistaken for a model server. `LOCAL_LLM_BASE_URL`
+  still wins when set. Previously the default was `localhost:8080` only.
+- The server found is remembered until it stops answering; the next call then searches
+  again, so switching servers doesn't need a restart. A connection reset (a server stopped
+  while a kept-alive connection was open) now counts as unreachable, like a refused one.
+- When nothing answers, the error lists the addresses tried and says which of Ollama and
+  llama-server is installed (on `PATH`) but not running, with the command to start it.
+- `local_llm_server_info` reports `base_url_source` (`LOCAL_LLM_BASE_URL` or e.g.
+  `auto-detected Ollama`).
+- The Read-gate hook checks the same addresses when `LOCAL_LLM_BASE_URL` isn't set, so it
+  works with Ollama without configuration. Its path in `hooks.json` is now quoted (flagged by
+  `claude plugin validate`).
+
+### Tests
+- `test/discovery.test.js`: preference order, fallback, an unrelated server on a default
+  port, `LOCAL_LLM_BASE_URL` precedence, re-detection after the server goes away, the
+  "none found" message with and without an installed binary, and no caching of a failed
+  search. Verified live against Ollama 0.40.2 with no configuration.
+
 ## Version 3.2.0 - Ollama backend
 
 ### Features

@@ -17,7 +17,24 @@ import packageJson from "./package.json" with { type: "json" };
 
 const execFileAsync = promisify(execFile);
 
-const LOCAL_LLM_BASE_URL = process.env.LOCAL_LLM_BASE_URL || "http://localhost:8080";
+// Where to look for a local LLM server when LOCAL_LLM_BASE_URL isn't set, in this order. Only
+// a running server can be found; `binary` and `start` explain an installed-but-stopped one.
+const DEFAULT_SERVERS = [
+  {
+    name: "Ollama",
+    url: "http://localhost:11434",
+    backend: "ollama",
+    binary: "ollama",
+    start: "`ollama serve` (or `brew services start ollama`)",
+  },
+  {
+    name: "llama-server",
+    url: "http://localhost:8080",
+    backend: "openai",
+    binary: "llama-server",
+    start: "`llama-server -m <model.gguf> --port 8080`",
+  },
+];
 // Defensive ceiling on generated tokens per call. With a reasoning model and no cap, a
 // single tool call can spend an unbounded number of hidden <think> tokens before ever
 // producing a visible answer -- this bounds worst-case latency without being tight enough
@@ -52,6 +69,25 @@ const MODEL_ARG_SCHEMA = {
   description:
     "Optional model override. If omitted, the model currently loaded by the local LLM server is auto-detected.",
 };
+
+// A request that couldn't reach the server: refused outright, or reset because the server went
+// away while a kept-alive connection to it was still open.
+function isUnreachable(error) {
+  return error.code === "ECONNREFUSED" || error.code === "ECONNRESET";
+}
+
+// Whether an executable of this name is on PATH, for the "installed but not running" hint.
+async function isOnPath(binary) {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+    try {
+      await fs.access(path.join(dir, binary), fs.constants.X_OK);
+      return true;
+    } catch {
+      // not in this directory
+    }
+  }
+  return false;
+}
 
 function cosineSimilarity(a, b) {
   let dot = 0;
@@ -146,6 +182,8 @@ class LocalLlmServer {
     this.modelsCacheAt = 0;
     this.maxContextCache = new Map();
     this.confirmedModels = new Set();
+    this.defaultServers = DEFAULT_SERVERS;
+    this.target = null;
     this.pulls = new Map();
     this.tokenStats = { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, perTool: {} };
 
@@ -483,33 +521,98 @@ class LocalLlmServer {
     });
   }
 
-  connectionErrorMessage() {
-    return `Cannot connect to local LLM server. Make sure it's running at ${LOCAL_LLM_BASE_URL} and is either Ollama or OpenAI-compatible (llama-server, vLLM, LM Studio, etc.).`;
+  // Builds the error for a refused connection, and forgets the server it was talking to, so the
+  // next call looks for one again -- e.g. after switching from llama-server to Ollama.
+  connectionError(error) {
+    if (error.noServerFound) return error; // already says what was tried
+    const url = this.target?.url ?? process.env.LOCAL_LLM_BASE_URL;
+    this.target = null;
+    this.modelsCache = null;
+    return new Error(
+      `Cannot connect to local LLM server. Make sure it's running at ${url} and is either Ollama or OpenAI-compatible (llama-server, vLLM, LM Studio, etc.).`,
+      { cause: error }
+    );
   }
 
-  // "ollama" or "openai". Ollama also speaks the OpenAI-compatible /v1 API, but only its
-  // native /api/chat can set a per-request context window (see MIN_CTX), so it gets its own
-  // request path. Detected once by probing Ollama's /api/version, which OpenAI-compatible
-  // servers 404 on; LOCAL_LLM_BACKEND=ollama|openai skips the probe.
-  async detectBackend() {
-    if (this.backend) return this.backend;
+  // The server to talk to, as { url, backend, source }. LOCAL_LLM_BASE_URL wins when set;
+  // otherwise the first of DEFAULT_SERVERS that answers. Cached until a connection error.
+  async locateServer() {
+    if (this.target) return this.target;
 
+    const configured = process.env.LOCAL_LLM_BASE_URL;
+    if (configured) {
+      const backend = await this.probeBackend(configured);
+      // Unreachable: don't cache a guess -- the request that follows surfaces the real
+      // connection error, and the next call probes again.
+      if (!backend) return { url: configured, backend: "openai", source: "LOCAL_LLM_BASE_URL" };
+      this.target = { url: configured, backend, source: "LOCAL_LLM_BASE_URL" };
+      return this.target;
+    }
+
+    for (const candidate of this.defaultServers) {
+      if (await this.isServerAt(candidate)) {
+        this.target = { url: candidate.url, backend: candidate.backend, source: `auto-detected ${candidate.name}` };
+        return this.target;
+      }
+    }
+    // Marked as a refused connection, so the request paths' existing ECONNREFUSED handling
+    // passes it through connectionError unchanged instead of wrapping it.
+    const error = new Error(await this.noServerFoundMessage());
+    error.code = "ECONNREFUSED";
+    error.noServerFound = true;
+    throw error;
+  }
+
+  // "ollama" or "openai" for a configured URL, or null if nothing answers. Ollama also speaks
+  // the OpenAI-compatible /v1 API, but only its native /api/chat can set a per-request context
+  // window (see MIN_CTX), so it gets its own request path. Detected by probing Ollama's
+  // /api/version, which OpenAI-compatible servers 404 on; LOCAL_LLM_BACKEND=ollama|openai skips
+  // the probe.
+  async probeBackend(url) {
     const override = process.env.LOCAL_LLM_BACKEND;
-    if (override === "ollama" || override === "openai") {
-      this.backend = override;
-      return this.backend;
-    }
-
+    if (override === "ollama" || override === "openai") return override;
     try {
-      const response = await axios.get(`${LOCAL_LLM_BASE_URL}/api/version`, { timeout: 5000 });
-      this.backend = typeof response.data?.version === "string" ? "ollama" : "openai";
+      const response = await axios.get(`${url}/api/version`, { timeout: 5000 });
+      return typeof response.data?.version === "string" ? "ollama" : "openai";
     } catch (error) {
-      // No HTTP response at all (server down, timeout): don't cache a guess -- the request
-      // that follows surfaces the real connection error, and the next call probes again.
-      if (!error.response) return "openai";
-      this.backend = "openai";
+      return error.response ? "openai" : null;
     }
-    return this.backend;
+  }
+
+  // Stricter than probeBackend, since nobody chose these addresses: a default port only counts
+  // when the expected server answers on it (Ollama's version, or an OpenAI-style model list),
+  // not just anything listening there, like an unrelated dev server on 8080.
+  async isServerAt(candidate) {
+    try {
+      if (candidate.backend === "ollama") {
+        const response = await axios.get(`${candidate.url}/api/version`, { timeout: 2000 });
+        return typeof response.data?.version === "string";
+      }
+      const response = await axios.get(`${candidate.url}/v1/models`, { timeout: 2000 });
+      return Array.isArray(response.data?.data);
+    } catch {
+      return false;
+    }
+  }
+
+  async noServerFoundMessage() {
+    const tried = this.defaultServers.map((candidate) => `${candidate.name} at ${candidate.url}`).join(", ");
+    const installed = [];
+    for (const candidate of this.defaultServers) {
+      if (await isOnPath(candidate.binary)) installed.push(`${candidate.name} is installed but not running; start it with ${candidate.start}.`);
+    }
+    const hint = installed.length
+      ? installed.join(" ")
+      : "Install Ollama or llama.cpp, or set LOCAL_LLM_BASE_URL for another OpenAI-compatible server (vLLM, LM Studio, etc.).";
+    return `Cannot connect to local LLM server: LOCAL_LLM_BASE_URL isn't set and none answered at the default addresses (${tried}). ${hint}`;
+  }
+
+  async detectBackend() {
+    return (await this.locateServer()).backend;
+  }
+
+  async serverUrl() {
+    return (await this.locateServer()).url;
   }
 
   // Ollama's /v1/models lists every *installed* model rather than what's loaded, so taking
@@ -518,8 +621,8 @@ class LocalLlmServer {
   // can keep chat tools off embedding-only models and vice versa.
   async fetchOllamaModels() {
     const [ps, tags] = await Promise.all([
-      axios.get(`${LOCAL_LLM_BASE_URL}/api/ps`, { timeout: 5000 }),
-      axios.get(`${LOCAL_LLM_BASE_URL}/api/tags`, { timeout: 5000 }),
+      axios.get(`${await this.serverUrl()}/api/ps`, { timeout: 5000 }),
+      axios.get(`${await this.serverUrl()}/api/tags`, { timeout: 5000 }),
     ]);
     const loaded = ps.data?.models ?? [];
     const installed = tags.data?.models ?? [];
@@ -539,7 +642,7 @@ class LocalLlmServer {
       if ((await this.detectBackend()) === "ollama") {
         models = await this.fetchOllamaModels();
       } else {
-        const response = await axios.get(`${LOCAL_LLM_BASE_URL}/v1/models`, {
+        const response = await axios.get(`${await this.serverUrl()}/v1/models`, {
           timeout: 5000,
         });
         models = response.data?.data ?? [];
@@ -553,8 +656,8 @@ class LocalLlmServer {
       return models;
     } catch (error) {
       this.modelsCache = null;
-      if (error.code === "ECONNREFUSED") {
-        throw new Error(this.connectionErrorMessage(), { cause: error });
+      if (isUnreachable(error)) {
+        throw this.connectionError(error);
       }
       throw new Error(`Failed to discover model from local LLM server: ${error.message}`, { cause: error });
     }
@@ -611,7 +714,7 @@ class LocalLlmServer {
     // Ollama lists untagged names with an explicit ":latest".
     const tagged = name.includes(":") ? name : `${name}:latest`;
     try {
-      const tags = await axios.get(`${LOCAL_LLM_BASE_URL}/api/tags`, { timeout: 5000 });
+      const tags = await axios.get(`${await this.serverUrl()}/api/tags`, { timeout: 5000 });
       const installed = (tags.data?.models ?? []).map((model) => model.name);
       if (!installed.includes(tagged)) {
         if (!this.pulls.has(tagged)) {
@@ -620,8 +723,8 @@ class LocalLlmServer {
         await this.pulls.get(tagged);
       }
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
-        throw new Error(this.connectionErrorMessage(), { cause: error });
+      if (isUnreachable(error)) {
+        throw this.connectionError(error);
       }
       throw error;
     }
@@ -631,9 +734,9 @@ class LocalLlmServer {
   async pullOllamaModel(name) {
     console.error(`[local-llm-mcp] ${name} is configured but not installed; pulling it from Ollama...`);
     try {
-      await axios.post(`${LOCAL_LLM_BASE_URL}/api/pull`, { model: name, stream: false }, { timeout: PULL_TIMEOUT_MS });
+      await axios.post(`${await this.serverUrl()}/api/pull`, { model: name, stream: false }, { timeout: PULL_TIMEOUT_MS });
     } catch (error) {
-      if (error.code === "ECONNREFUSED") throw error;
+      if (isUnreachable(error)) throw error;
       const reason = error.response?.data?.error ?? error.message;
       throw new Error(`${name} is configured but not installed, and pulling it failed: ${reason}`, { cause: error });
     }
@@ -654,8 +757,8 @@ class LocalLlmServer {
           ? await this.ollamaChat(resolved.id, messages, enableThinking)
           : await this.openAiChat(resolved.id, messages, enableThinking);
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
-        throw new Error(this.connectionErrorMessage(), { cause: error });
+      if (isUnreachable(error)) {
+        throw this.connectionError(error);
       }
       // Ollama and llama-server explain failures (e.g. "model 'x' not found") in the body's
       // `error` field, which axios's own message ("status code 404") leaves out.
@@ -691,7 +794,7 @@ class LocalLlmServer {
       body.chat_template_kwargs = { enable_thinking: enableThinking };
     }
 
-    const response = await axios.post(`${LOCAL_LLM_BASE_URL}/v1/chat/completions`, body, {
+    const response = await axios.post(`${await this.serverUrl()}/v1/chat/completions`, body, {
       timeout: 900000, // 15 minute timeout (overly long, to account for slow local models)
     });
     const choice = response.data.choices[0];
@@ -707,7 +810,7 @@ class LocalLlmServer {
     const body = { model, messages, stream: false, options };
     if (enableThinking !== undefined) body.think = enableThinking;
 
-    const response = await axios.post(`${LOCAL_LLM_BASE_URL}/api/chat`, body, {
+    const response = await axios.post(`${await this.serverUrl()}/api/chat`, body, {
       timeout: 900000, // 15 minute timeout (overly long, to account for slow local models)
     });
     const data = response.data;
@@ -745,7 +848,7 @@ class LocalLlmServer {
 
     let running = await this.ollamaRunningContext(model);
     if (running === null) {
-      await axios.post(`${LOCAL_LLM_BASE_URL}/api/chat`, { model, messages: [] }, { timeout: 900000 });
+      await axios.post(`${await this.serverUrl()}/api/chat`, { model, messages: [] }, { timeout: 900000 });
       running = await this.ollamaRunningContext(model);
     }
     return running !== null && running >= MIN_CTX ? running : MIN_CTX;
@@ -755,7 +858,7 @@ class LocalLlmServer {
   // model isn't loaded or the lookup fails.
   async ollamaRunningContext(model) {
     try {
-      const ps = await axios.get(`${LOCAL_LLM_BASE_URL}/api/ps`, { timeout: 5000 });
+      const ps = await axios.get(`${await this.serverUrl()}/api/ps`, { timeout: 5000 });
       return ps.data?.models?.find((entry) => entry.name === model)?.context_length ?? null;
     } catch {
       return null;
@@ -769,7 +872,7 @@ class LocalLlmServer {
   async ollamaMaxContext(model) {
     if (this.maxContextCache.has(model)) return this.maxContextCache.get(model);
     try {
-      const show = await axios.post(`${LOCAL_LLM_BASE_URL}/api/show`, { model }, { timeout: 5000 });
+      const show = await axios.post(`${await this.serverUrl()}/api/show`, { model }, { timeout: 5000 });
       const modelInfo = show.data?.model_info ?? {};
       const key = Object.keys(modelInfo).find((name) => name.endsWith(".context_length"));
       const maxContext = key ? modelInfo[key] : null;
@@ -815,7 +918,7 @@ class LocalLlmServer {
     }
     try {
       const response = await axios.post(
-        `${LOCAL_LLM_BASE_URL}/tokenize`,
+        `${await this.serverUrl()}/tokenize`,
         { content: text },
         { timeout: 10000 }
       );
@@ -824,8 +927,8 @@ class LocalLlmServer {
       if (include_tokens) info.tokens = tokens;
       return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
-        throw new Error(this.connectionErrorMessage(), { cause: error });
+      if (isUnreachable(error)) {
+        throw this.connectionError(error);
       }
       throw new Error(`Failed to tokenize text: ${error.message}`, { cause: error });
     }
@@ -837,7 +940,7 @@ class LocalLlmServer {
 
     try {
       const response = await axios.post(
-        `${LOCAL_LLM_BASE_URL}/v1/embeddings`,
+        `${await this.serverUrl()}/v1/embeddings`,
         { model: resolved.id, input: [query, ...candidates] },
         { timeout: 60000 }
       );
@@ -854,8 +957,8 @@ class LocalLlmServer {
 
       return { content: [{ type: "text", text: JSON.stringify({ results }, null, 2) }] };
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
-        throw new Error(this.connectionErrorMessage(), { cause: error });
+      if (isUnreachable(error)) {
+        throw this.connectionError(error);
       }
       throw new Error(`Failed to compute semantic similarity: ${error.message}`, { cause: error });
     }
@@ -996,10 +1099,10 @@ class LocalLlmServer {
 
     let modelsResponse;
     try {
-      modelsResponse = await axios.get(`${LOCAL_LLM_BASE_URL}/v1/models`, { timeout: 5000 });
+      modelsResponse = await axios.get(`${await this.serverUrl()}/v1/models`, { timeout: 5000 });
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
-        throw new Error(this.connectionErrorMessage(), { cause: error });
+      if (isUnreachable(error)) {
+        throw this.connectionError(error);
       }
       throw new Error(`Failed to fetch local LLM server info: ${error.message}`, { cause: error });
     }
@@ -1009,7 +1112,7 @@ class LocalLlmServer {
     // vLLM, LM Studio, etc. that don't have it.
     let props = null;
     try {
-      props = (await axios.get(`${LOCAL_LLM_BASE_URL}/props`, { timeout: 5000 })).data;
+      props = (await axios.get(`${await this.serverUrl()}/props`, { timeout: 5000 })).data;
     } catch {
       // no-op: props stays null, matching a backend that doesn't implement /props
     }
@@ -1017,7 +1120,8 @@ class LocalLlmServer {
     const model = modelsResponse.data?.data?.[0];
     const info = {
       backend: "openai",
-      base_url: LOCAL_LLM_BASE_URL,
+      base_url: await this.serverUrl(),
+      base_url_source: (await this.locateServer()).source,
       model_id: model?.id ?? null,
       model_family: model?.id ? resolveFamily(model.id) : null,
       context_size: props?.default_generation_settings?.n_ctx ?? props?.n_ctx ?? null,
@@ -1039,13 +1143,13 @@ class LocalLlmServer {
     let model;
     try {
       [version, ps] = await Promise.all([
-        axios.get(`${LOCAL_LLM_BASE_URL}/api/version`, { timeout: 5000 }),
-        axios.get(`${LOCAL_LLM_BASE_URL}/api/ps`, { timeout: 5000 }),
+        axios.get(`${await this.serverUrl()}/api/version`, { timeout: 5000 }),
+        axios.get(`${await this.serverUrl()}/api/ps`, { timeout: 5000 }),
       ]);
       model = await this.resolveModel(undefined, "server_info");
     } catch (error) {
-      if (error.code === "ECONNREFUSED") {
-        throw new Error(this.connectionErrorMessage(), { cause: error });
+      if (isUnreachable(error)) {
+        throw this.connectionError(error);
       }
       throw new Error(`Failed to fetch local LLM server info: ${error.message}`, { cause: error });
     }
@@ -1054,7 +1158,8 @@ class LocalLlmServer {
     const maxContext = await this.ollamaMaxContext(model.id);
     const info = {
       backend: "ollama",
-      base_url: LOCAL_LLM_BASE_URL,
+      base_url: await this.serverUrl(),
+      base_url_source: (await this.locateServer()).source,
       ollama_version: version.data?.version ?? null,
       model_id: model.id,
       model_family: model.family,
@@ -1076,7 +1181,8 @@ class LocalLlmServer {
       await this.server.close();
       process.exit(0);
     });
-    console.error(`local LLM MCP server running on stdio (target: ${LOCAL_LLM_BASE_URL})`);
+    const target = process.env.LOCAL_LLM_BASE_URL ?? DEFAULT_SERVERS.map((candidate) => candidate.url).join(", then ");
+    console.error(`local LLM MCP server running on stdio (target: ${target})`);
   }
 }
 
