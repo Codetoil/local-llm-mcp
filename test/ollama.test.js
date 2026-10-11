@@ -42,6 +42,7 @@ beforeEach(() => {
   mock.state.defaultContext = 4096;
   mock.state.loads = 0;
   mock.state.pullable = {};
+  mock.state.decision = () => ({ effort: { type: "choice", choice: "high", probabilities: { low: 0.2, high: 0.8 } } });
   mock.state.doneReason = "stop";
 });
 
@@ -341,8 +342,9 @@ describe("auto-pull of configured models (Ollama)", () => {
     process.env.LOCAL_LLM_CHAT_MODEL = "llama3.2:latest";
     const server = new LocalLlmServer();
     await server.generateCode({ prompt: "x", language: "python" });
+    const afterFirstCall = requestsTo("/api/tags").length;
     await server.generateCode({ prompt: "y", language: "python" });
-    assert.equal(requestsTo("/api/tags").length, 1);
+    assert.equal(requestsTo("/api/tags").length, afterFirstCall);
   });
 
   test("concurrent first calls share a single pull", async () => {
@@ -379,5 +381,122 @@ describe("auto-pull of configured models (Ollama)", () => {
     const server = new LocalLlmServer();
     await assert.rejects(() => server.generateCode({ model: "gemma4:e4b", prompt: "x", language: "python" }), /not found/);
     assert.equal(requestsTo("/api/pull").length, 0);
+  });
+});
+
+describe("thinking decisions (Ollama)", () => {
+  const LAYA = { name: "laya:latest", capabilities: ["decision"], maxContext: 512 };
+  const answer = (choice, p) => () => ({
+    effort: { type: "choice", choice, probabilities: { low: choice === "low" ? p : 1 - p, high: choice === "high" ? p : 1 - p } },
+  });
+
+  beforeEach(() => {
+    mock.state.installed = [...DEFAULT_INSTALLED, LAYA];
+  });
+
+  afterEach(() => {
+    delete process.env.LOCAL_LLM_DECISION_MODEL;
+    delete TOOL_REASONING_OVERRIDES.generate_code;
+  });
+
+  test("a confident 'high' turns thinking on, using the installed decision model", async () => {
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "find the race condition in this job queue", language: "go" });
+    const [decision] = requestsTo("/v1/systemone");
+    assert.equal(decision.body.model, "laya:latest");
+    assert.equal(decision.body.state.tool, "generate_code");
+    assert.match(decision.body.state.request, /race condition/);
+    assert.ok(decision.body.questions.effort.criteria.low && decision.body.questions.effort.criteria.high);
+    assert.equal(chatRequests()[0].body.think, true);
+  });
+
+  test("a confident 'low' turns thinking off", async () => {
+    mock.state.decision = answer("low", 0.78);
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "is_even(n)", language: "python" });
+    assert.equal(chatRequests()[0].body.think, false);
+  });
+
+  test("an unsure answer leaves the chat model's own default", async () => {
+    mock.state.decision = answer("high", 0.55);
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "x", language: "python" });
+    assert.equal(chatRequests()[0].body.think, undefined);
+    assert.equal(server.thinkingDecisions.unsure, 1);
+  });
+
+  test("sends the instruction and code size, never the code itself", async () => {
+    const filePath = path.join(tmpDir, "big.js");
+    await fs.writeFile(filePath, Array.from({ length: 300 }, (_, i) => `const secretValue${i} = ${i};`).join("\n"));
+    const server = new LocalLlmServer();
+    await server.reviewFile({ file_path: filePath, focus: "concurrency bugs" });
+    const { state } = requestsTo("/v1/systemone")[0].body;
+    assert.deepEqual(state, { tool: "review_file", request: "concurrency bugs", code_lines: 300 });
+  });
+
+  test("a request without instructions says so instead of sending an empty string", async () => {
+    const filePath = path.join(tmpDir, "small.js");
+    await fs.writeFile(filePath, "export const a = 1;\n");
+    const server = new LocalLlmServer();
+    await server.reviewFile({ file_path: filePath });
+    assert.equal(requestsTo("/v1/systemone")[0].body.state.request, "(no instructions beyond the tool itself)");
+  });
+
+  test("no decision model installed: no decision, model default", async () => {
+    mock.state.installed = DEFAULT_INSTALLED;
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "x", language: "python" });
+    assert.equal(requestsTo("/v1/systemone").length, 0);
+    assert.equal(chatRequests()[0].body.think, undefined);
+  });
+
+  test("a chat model that can't think is never asked to", async () => {
+    const server = new LocalLlmServer();
+    await server.generateCode({ model: "llama3.2:latest", prompt: "x", language: "python" });
+    assert.equal(requestsTo("/v1/systemone").length, 0);
+    assert.equal(chatRequests()[0].body.think, undefined);
+  });
+
+  test("a fixed TOOL_REASONING_OVERRIDES entry wins, without asking", async () => {
+    TOOL_REASONING_OVERRIDES.generate_code = false;
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "find the race condition", language: "go" });
+    assert.equal(requestsTo("/v1/systemone").length, 0);
+    assert.equal(chatRequests()[0].body.think, false);
+  });
+
+  test("LOCAL_LLM_DECISION_MODEL=off disables it", async () => {
+    process.env.LOCAL_LLM_DECISION_MODEL = "off";
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "x", language: "python" });
+    assert.equal(requestsTo("/v1/systemone").length, 0);
+  });
+
+  test("a configured decision model that isn't installed is pulled, then used", async () => {
+    mock.state.installed = DEFAULT_INSTALLED;
+    mock.state.pullable = { "laya:421m-typed-decisions-mlx-fp16": { capabilities: ["decision"], maxContext: 1024 } };
+    process.env.LOCAL_LLM_DECISION_MODEL = "laya:421m-typed-decisions-mlx-fp16";
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "x", language: "python" });
+    assert.equal(requestsTo("/api/pull")[0].body.model, "laya:421m-typed-decisions-mlx-fp16");
+    assert.equal(requestsTo("/v1/systemone")[0].body.model, "laya:421m-typed-decisions-mlx-fp16");
+  });
+
+  test("a failing decision model never fails the call", async () => {
+    mock.state.decision = null;
+    const server = new LocalLlmServer();
+    const result = await server.generateCode({ prompt: "x", language: "python" });
+    assert.match(result.content[0].text, /echo:/);
+    assert.equal(chatRequests()[0].body.think, undefined);
+    assert.equal(server.thinkingDecisions.failed, 1);
+  });
+
+  test("session stats count the decisions", async () => {
+    const server = new LocalLlmServer();
+    await server.generateCode({ prompt: "x", language: "python" });
+    mock.state.decision = answer("low", 0.9);
+    await server.generateCode({ prompt: "y", language: "python" });
+    const stats = JSON.parse(server.sessionStats().content[0].text);
+    assert.deepEqual(stats.thinkingDecisions, { model: "laya:latest", decided: 2, thinkOn: 1, thinkOff: 1, unsure: 0, failed: 0 });
   });
 });

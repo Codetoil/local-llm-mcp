@@ -413,7 +413,14 @@ describe("sessionStats", () => {
   test("starts at zero before any calls", () => {
     const server = new LocalLlmServer();
     const stats = JSON.parse(server.sessionStats().content[0].text);
-    assert.deepEqual(stats, { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, perTool: {} });
+    assert.deepEqual(stats, {
+      calls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      perTool: {},
+      thinkingDecisions: { model: null, decided: 0, thinkOn: 0, thinkOff: 0, unsure: 0, failed: 0 },
+    });
   });
 
   test("accumulates usage across calls, with a per-tool breakdown", async () => {

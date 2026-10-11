@@ -53,6 +53,22 @@ const TRUNCATED_CHARS_PER_TOKEN = 8;
 const MODEL_CACHE_TTL_MS = 30_000;
 // Pulling a configured model can mean a multi-GB download; allow far longer than a chat call.
 const PULL_TIMEOUT_MS = 60 * 60_000;
+// Thinking decisions (Ollama): a decision model (e.g. Laya) answers "low or high reasoning?"
+// per request, and its answer only replaces the chat model's own default when it's at least
+// this sure -- shipped decision models are known to be over-confident, so this stays strict.
+const DECISION_MIN_PROBABILITY = 0.65;
+const DECISION_TIMEOUT_MS = 15_000; // the first call loads the decision model (~3s for Laya)
+const DECISION_REQUEST_CHAR_LIMIT = 1500; // Laya reads 512-1024 tokens; keep the state well inside
+const DECISION_QUESTIONS = {
+  effort: {
+    type: "choice",
+    instructions: "How much reasoning does this coding request need before answering?",
+    criteria: {
+      low: "mechanical or boilerplate: one obvious step, no analysis needed",
+      high: "needs analysis: debugging, security, concurrency, or multi-step design",
+    },
+  },
+};
 const GLOB_METACHARACTERS = /[*?[{]/;
 const MAX_GLOB_MATCHES = 50;
 const CODEGRAPH_CONTEXT_CHAR_LIMIT = 4000;
@@ -74,6 +90,24 @@ const MODEL_ARG_SCHEMA = {
 // away while a kept-alive connection to it was still open.
 function isUnreachable(error) {
   return error.code === "ECONNREFUSED" || error.code === "ECONNRESET";
+}
+
+// What a decision model sees of a request: the tool, the calling agent's own instruction text
+// (whichever of these fields the tool has), and how much code comes with it -- never the code
+// itself, which wouldn't fit a decision model's 512-1024-token input anyway.
+function decisionState(toolName, args) {
+  const instruction = [args.prompt, args.task, args.goal, args.error, args.focus, args.context, args.question]
+    .filter((part) => typeof part === "string" && part.trim())
+    .join("\n")
+    .slice(0, DECISION_REQUEST_CHAR_LIMIT);
+  const code = [args.code, args.filesContent, args.contextSection, args.diff, args.content]
+    .filter((part) => typeof part === "string")
+    .join("\n");
+  return {
+    tool: toolName,
+    request: instruction || "(no instructions beyond the tool itself)",
+    code_lines: code ? code.split("\n").length : 0,
+  };
 }
 
 // Whether an executable of this name is on PATH, for the "installed but not running" hint.
@@ -186,6 +220,7 @@ class LocalLlmServer {
     this.target = null;
     this.pulls = new Map();
     this.tokenStats = { calls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, perTool: {} };
+    this.thinkingDecisions = { model: null, decided: 0, thinkOn: 0, thinkOff: 0, unsure: 0, failed: 0 };
 
     this.setupToolHandlers();
 
@@ -748,12 +783,17 @@ class LocalLlmServer {
     const { model: explicitModel, ...promptArgs } = args;
     const resolved = await this.resolveModel(explicitModel, toolName);
     const messages = buildMessages(toolName, promptArgs, resolved.family);
-    const enableThinking = TOOL_REASONING_OVERRIDES[toolName];
+    const backend = await this.detectBackend();
+    // A fixed per-tool setting wins; otherwise a decision model may choose per request.
+    let enableThinking = TOOL_REASONING_OVERRIDES[toolName];
+    if (enableThinking === undefined && backend === "ollama") {
+      enableThinking = await this.decideThinking(toolName, promptArgs, resolved.id);
+    }
 
     let completion;
     try {
       completion =
-        (await this.detectBackend()) === "ollama"
+        backend === "ollama"
           ? await this.ollamaChat(resolved.id, messages, enableThinking)
           : await this.openAiChat(resolved.id, messages, enableThinking);
     } catch (error) {
@@ -781,6 +821,57 @@ class LocalLlmServer {
       text += `\n\n[WARNING: response was truncated at the ${MAX_TOKENS}-token generation limit (LOCAL_LLM_MAX_TOKENS) before finishing. Consider a narrower request, or raise the limit.]`;
     }
     return text;
+  }
+
+  // Asks a decision model (Ollama's POST /v1/systemone, e.g. Laya) whether this request needs
+  // the chat model to think, and returns true/false -- or undefined to leave the chat model's
+  // own default, which is also what happens when there's no decision model, the chat model
+  // can't think, the answer isn't sure enough, or anything fails. Never fails the call.
+  async decideThinking(toolName, promptArgs, chatModel) {
+    let decisionModel;
+    try {
+      decisionModel = await this.resolveDecisionModel();
+      if (!decisionModel) return undefined;
+      const chat = (await this.fetchAvailableModels()).find((model) => model.id === chatModel);
+      if (!chat?.capabilities?.includes("thinking")) return undefined;
+    } catch {
+      return undefined;
+    }
+
+    this.thinkingDecisions.model = decisionModel;
+    try {
+      const response = await axios.post(
+        `${await this.serverUrl()}/v1/systemone`,
+        { model: decisionModel, state: decisionState(toolName, promptArgs), questions: DECISION_QUESTIONS },
+        { timeout: DECISION_TIMEOUT_MS }
+      );
+      const { choice, probabilities } = response.data?.answers?.effort ?? {};
+      if (choice !== "low" && choice !== "high") throw new Error("no effort answer");
+      this.thinkingDecisions.decided += 1;
+      if ((probabilities?.[choice] ?? 0) < DECISION_MIN_PROBABILITY) {
+        this.thinkingDecisions.unsure += 1;
+        return undefined;
+      }
+      this.thinkingDecisions[choice === "high" ? "thinkOn" : "thinkOff"] += 1;
+      return choice === "high";
+    } catch {
+      this.thinkingDecisions.failed += 1;
+      return undefined;
+    }
+  }
+
+  // LOCAL_LLM_DECISION_MODEL picks the decision model ("off" disables thinking decisions) and is
+  // pulled if missing, like the other configured models. Unset, the first installed model with
+  // Ollama's "decision" capability is used -- never pulled, so nobody gets a surprise download.
+  async resolveDecisionModel() {
+    const configured = process.env.LOCAL_LLM_DECISION_MODEL;
+    if (configured === "off") return null;
+    if (configured) {
+      await this.ensureOllamaModel(configured);
+      return configured;
+    }
+    const models = await this.fetchAvailableModels();
+    return models.find((model) => model.capabilities?.includes("decision"))?.id ?? null;
   }
 
   async openAiChat(model, messages, enableThinking) {
@@ -908,7 +999,8 @@ class LocalLlmServer {
   }
 
   sessionStats() {
-    return { content: [{ type: "text", text: JSON.stringify(this.tokenStats, null, 2) }] };
+    const stats = { ...this.tokenStats, thinkingDecisions: this.thinkingDecisions };
+    return { content: [{ type: "text", text: JSON.stringify(stats, null, 2) }] };
   }
 
   async tokenize(args) {

@@ -176,7 +176,9 @@ export const TOOL_MODEL_PREFERENCES = {};
 // silently ignore it for templates that don't recognize it. With Ollama it's sent as Ollama's
 // own `think` flag instead, which works for any Ollama thinking model. Populate your own, e.g.
 // { generate_code: false, fix_code: true } to skip thinking on quick generation but keep
-// it for harder debugging.
+// it for harder debugging. With Ollama and a decision model installed (e.g. Laya), tools
+// without an entry here get a per-request decision instead (see decideThinking in index.js);
+// an entry here always wins over that.
 export const TOOL_REASONING_OVERRIDES = {};
 
 export function buildMessages(toolName, args, family) {

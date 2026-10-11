@@ -27,6 +27,8 @@ export function startMockOllamaServer() {
     evalCount: 20,
     doneReason: "stop",
     embeddings: (inputs) => inputs.map((text) => [text.length, 1, 0]),
+    // Answers for POST /v1/systemone (decision models such as Laya); null makes it fail.
+    decision: () => ({ effort: { type: "choice", choice: "high", probabilities: { low: 0.2, high: 0.8 } } }),
   };
 
   const server = http.createServer((req, res) => {
@@ -99,6 +101,15 @@ export function startMockOllamaServer() {
           prompt_eval_count: state.promptEvalCount(body),
           eval_count: state.evalCount,
         });
+      }
+
+      if (req.method === "POST" && req.url === "/v1/systemone") {
+        const model = state.installed.find((entry) => entry.name === body.model);
+        if (!model?.capabilities?.includes("decision") || !state.decision) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "decision failed" }));
+        }
+        return reply({ model: body.model, answers: state.decision(body), usage: { input_tokens: 40, output_tokens: 1 } });
       }
 
       if (req.method === "POST" && req.url === "/v1/embeddings") {
