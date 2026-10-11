@@ -135,8 +135,22 @@ curl http://localhost:8080/health
 curl http://localhost:8080/v1/models
 ```
 
-By default this MCP server talks to `http://localhost:8080`. Override with the
-`LOCAL_LLM_BASE_URL` environment variable if you run `llama-server` on a different host/port:
+### Finding the server
+
+With no configuration, the server looks for a running local LLM server itself, in this order:
+
+1. **Ollama** at `http://localhost:11434` (it must answer `GET /api/version`)
+2. **llama-server** at `http://localhost:8080` (it must answer `GET /v1/models` with a model
+   list, so an unrelated app listening on 8080 isn't mistaken for it)
+
+The first one that answers is used, and remembered until it stops answering. The next call
+then searches again, so switching from one server to the other doesn't need a restart. If
+neither answers, the error names what was tried and which of the two is installed but not
+running, with the command that starts it. `local_llm_server_info` reports which server was
+used and how it was found (`base_url_source`).
+
+Set `LOCAL_LLM_BASE_URL` to skip the search, e.g. for a server on another host or port, or
+for vLLM and LM Studio:
 
 ```bash
 export LOCAL_LLM_BASE_URL=http://localhost:8081
@@ -144,14 +158,10 @@ export LOCAL_LLM_BASE_URL=http://localhost:8081
 
 ### Using Ollama
 
-Point `LOCAL_LLM_BASE_URL` at Ollama (default port 11434):
-
-```bash
-export LOCAL_LLM_BASE_URL=http://localhost:11434
-```
-
-The server detects Ollama on the first call by probing `GET /api/version`, which
-OpenAI-compatible servers don't have. Set `LOCAL_LLM_BACKEND=ollama` or
+Start Ollama (`ollama serve`, or `brew services start ollama`); the server finds it on its
+default port without any configuration (see "Finding the server" above). With
+`LOCAL_LLM_BASE_URL` set to an Ollama address instead, the server recognizes Ollama by
+probing `GET /api/version`, which OpenAI-compatible servers don't have. Set `LOCAL_LLM_BACKEND=ollama` or
 `LOCAL_LLM_BACKEND=openai` to skip the probe and force either path. With Ollama:
 
 - **Chat goes through the native `POST /api/chat`**, not Ollama's `/v1` compatibility layer,
@@ -338,7 +348,6 @@ config:
       "command": "npx",
       "args": ["-y", "github:hlgr360/local-llm-mcp"],
       "env": {
-        "LOCAL_LLM_BASE_URL": "http://localhost:11434",
         "LOCAL_LLM_CHAT_MODEL": "gemma4:e4b-mlx",
         "LOCAL_LLM_EMBEDDING_MODEL": "nomic-embed-text"
       }
@@ -456,10 +465,11 @@ Add new tools by:
 ### "Cannot connect to local LLM server" Error
 - Ensure your backend is running, e.g. `llama-server -m <model.gguf> --jinja --port 8080`
   or `ollama serve`
-- Check it's on the expected port: `curl http://localhost:8080/health` (or your backend's
-  equivalent health/models endpoint, e.g. `curl http://localhost:11434/api/version` for
-  Ollama)
-- Confirm `LOCAL_LLM_BASE_URL` (if set) matches where your backend is actually listening
+- Without `LOCAL_LLM_BASE_URL`, only the default addresses are searched: Ollama on 11434 and
+  llama-server on 8080 (see "Finding the server"). The error says which of them is installed
+  but not running. Check with `curl http://localhost:11434/api/version` or
+  `curl http://localhost:8080/v1/models`
+- If `LOCAL_LLM_BASE_URL` is set, confirm it matches where your backend is actually listening
 
 ### Tools Not Appearing in Your MCP Client
 - Verify the config path is correct
