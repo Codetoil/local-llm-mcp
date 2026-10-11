@@ -11,6 +11,17 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/local-llm-prompt-nudge.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

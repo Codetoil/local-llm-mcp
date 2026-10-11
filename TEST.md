@@ -22,6 +22,8 @@ stands in for `llama-server`'s `/v1/models`, `/v1/chat/completions`, and `/props
   pointed at mocks, never the real default ports)
 - `test/review-diff.test.js` — `review_diff` against real temporary git repositories, including
   option injection and a repository whose config tries to run programs
+- `test/hooks.test.js` — the plugin's shell hooks run as real processes: which prompts get which
+  tool hint, the Read gate's deny-then-allow, and both staying silent when no server answers
 - `test/server-unreachable.test.js` — the friendly connection-error path when `llama-server` is down
 - `test/integration.test.js` — spawns the real `node index.js` entry point and drives it over MCP
   JSON-RPC (`tools/list`, `tools/call`), the same way any MCP client (Claude Code, Cursor, etc.) does

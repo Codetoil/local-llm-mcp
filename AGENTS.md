@@ -90,6 +90,12 @@ for Ollama).
   headers. **`digest_file`**: `digestContent` strips ANSI codes, keeps the original line
   numbers, and over `DIGEST_CHAR_BUDGET` (100k chars, prefixes counted) keeps 20% head / 80%
   tail with an omitted-lines marker.
+  **Plugin hooks** (`hooks/`, Claude Code only): `local-llm-read-gate.sh` (PreToolUse on Read)
+  and `local-llm-prompt-nudge.sh` (UserPromptSubmit: matches the prompt's words against tool
+  use cases, most specific first, and adds one `additionalContext` line naming the tool).
+  Both source `local-llm-common.sh` for `local_llm_reachable` and must stay silent (`{}`)
+  when nothing matches or no server answers. `test/hooks.test.js` runs them as real
+  processes; it must spawn asynchronously, or the in-process mock can't answer their curl.
   `getCodeGraphContext(query, cwd)` is a best-effort helper the file-aware tools call:
   if `cwd` (default `process.cwd()`) has a `.codegraph/` directory, it shells out to
   `codegraph explore <query>` (binary overridable via `CODEGRAPH_BIN`, mainly for tests) and

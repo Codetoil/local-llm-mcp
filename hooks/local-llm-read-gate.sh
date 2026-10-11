@@ -40,15 +40,10 @@ touch "$STATE_FILE"
 # Already denied once this session -- let the retry through.
 grep -qF "$file_path" "$STATE_FILE" 2>/dev/null && allow
 
-# Connectivity gate: only enforce if a local LLM server is actually up -- LOCAL_LLM_BASE_URL if
-# set, otherwise the same defaults the MCP server looks for: Ollama, then llama-server.
-if [ -n "${LOCAL_LLM_BASE_URL:-}" ]; then
-  curl -sf --max-time 1 "$LOCAL_LLM_BASE_URL/v1/models" >/dev/null 2>&1 || allow
-else
-  curl -sf --max-time 1 http://localhost:11434/api/version >/dev/null 2>&1 \
-    || curl -sf --max-time 1 http://localhost:8080/v1/models >/dev/null 2>&1 \
-    || allow
-fi
+# Connectivity gate: only enforce if a local LLM server is actually up.
+# shellcheck source=local-llm-common.sh
+. "$(dirname "$0")/local-llm-common.sh"
+local_llm_reachable || allow
 
 printf '%s\n' "$file_path" >> "$STATE_FILE"
 

@@ -314,8 +314,26 @@ server can't run from the plugin's own bundled source), and additionally install
 reading whole files by hand. The hook only activates when a local LLM server is actually
 reachable (it fails open otherwise), and only blocks the *first* `Read` of a given file per
 session — a second `Read` on the same path goes through, so it doesn't fight the `Edit` tool's
-own read-before-edit requirement. This is Claude-Code-specific plumbing on top of the
-provider-agnostic core above; every other MCP client should keep using Option A or B.
+own read-before-edit requirement.
+
+It also installs a **`UserPromptSubmit` hook** that points Claude at the right tool when a
+prompt asks for what the local model is good at. Claude Code loads MCP tools as deferred
+names, which Claude rarely reaches for unprompted; the hook adds one line to its context
+instead, e.g. *"local-llm: for long command output, redirect it to a file … and call
+local_llm_digest_file on it"*. It recognizes requests to review git changes
+(`local_llm_review_diff`), test, build or CI output and logs (`local_llm_digest_file`), file
+reviews (`local_llm_review_file`), explanations (`local_llm_explain_file`) and cross-file
+questions (`local_llm_analyze_files`). It matches the prompt's words first, so most prompts
+cost no network call, and only adds the line when a local LLM server answers (about 40 ms on
+a match). Both hooks share their server check (`hooks/local-llm-common.sh`) and need `jq` and
+`curl`.
+
+This is Claude-Code-specific plumbing on top of the provider-agnostic core above; every other
+MCP client should keep using Option A or B. For a stronger steer in Claude Code without the
+plugin, or on top of it, add a few lines to your `CLAUDE.md` saying when to offload, e.g.
+reviews and explanations of larger files, test or build logs (via `local_llm_digest_file`) and
+diffs you didn't write (via `local_llm_review_diff`), but not small files or files you're about
+to edit.
 
 ### 4. Restart Your MCP Client
 
@@ -624,6 +642,7 @@ local-llm-mcp/
 │   ├── ollama.test.js
 │   ├── discovery.test.js
 │   ├── review-diff.test.js
+│   ├── hooks.test.js
 │   ├── server-unreachable.test.js
 │   └── integration.test.js
 ├── scripts/
