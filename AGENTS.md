@@ -90,7 +90,13 @@ Running against a **real** `llama-server` requires it to already be up (default
   hardware — don't "fix" this down without checking `TEST.md`'s timing notes.
 - `LOCAL_LLM_BASE_URL` is read once at module import time as a top-level constant; it can't
   be changed per-instance at runtime. Tests that need a fresh backend URL do so in their
-  own file/process (see `test/server-unreachable.test.js`).
+  own file/process (see `test/server-unreachable.test.js`). `LOCAL_LLM_EMBED_ONLY` has the
+  same shape, hence `test/embed-only.test.js` being its own spawned process.
+- `LOCAL_LLM_EMBED_ONLY` filters `ListTools` down to `EMBED_ONLY_TOOLS` (the three tools an
+  embedding backend can serve: `semantic_similarity`, `tokenize`, `server_info`) and swaps
+  `SERVER_INSTRUCTIONS` for `EMBED_ONLY_INSTRUCTIONS`. **Adding a tool that doesn't need
+  `/v1/chat/completions` means adding it to `EMBED_ONLY_TOOLS` too** — the set is an
+  allowlist, so a new primitive silently stays hidden in embed-only mode otherwise.
 - `index.js`'s shebang line, its `bin` entry in `package.json`, and the
   `import.meta.url === file://${realpathSync(process.argv[1])}` auto-start guard are all
   load-bearing for `npx github:hlgr360/local-llm-mcp` to work (the npm registry package

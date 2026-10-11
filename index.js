@@ -27,6 +27,19 @@ const LOCAL_LLM_BASE_URL = process.env.LOCAL_LLM_BASE_URL || "http://localhost:8
 // socketPath is set.
 const LOCAL_LLM_SOCKET_PATH = process.env.LOCAL_LLM_SOCKET_PATH || null;
 
+// Embed-only mode, for fronting an embedding model (nomic-embed-text, bge, e5, ...)
+// rather than a generative one. Such a backend serves /v1/embeddings and /tokenize but
+// has no chat-completion endpoint and usually no chat template, so the twelve
+// chat-backed tools can only ever fail against it. Declaring it up front keeps them out
+// of the tool list entirely, instead of offering the calling agent a dozen tools that
+// error on use and letting it discover which three work by trial.
+const EMBED_ONLY = /^(1|true|yes|on)$/i.test(process.env.LOCAL_LLM_EMBED_ONLY ?? "");
+const EMBED_ONLY_TOOLS = new Set([
+  "local_llm_semantic_similarity",
+  "local_llm_tokenize",
+  "local_llm_server_info",
+]);
+
 // Single client for every backend call, so the transport choice lives in one place and
 // call sites issue relative paths in both modes.
 const api = axios.create(
@@ -56,6 +69,10 @@ const SERVER_INSTRUCTIONS = `Offloads code-shaped work (generation, review, refa
 For anything already on disk, prefer the file-aware tools (local_llm_review_file, local_llm_explain_file, local_llm_analyze_files, local_llm_generate_code_with_context) over reading the file yourself and pasting it into the string-based tools -- the file-aware tools read server-side, at roughly 50 tokens of your context versus thousands for a full read. local_llm_analyze_files also works well for cross-file consistency checks (e.g. "do these docs agree with each other"), not just dependency/relationship analysis.
 
 This server has no internet access and no knowledge of anything outside the files you point it at. Don't use it for questions needing current external knowledge (library APIs, changelogs, GitHub issues, current docs) -- it will confabulate specifics rather than refuse. Verify its output before trusting it, the same way you would a fast but occasionally-wrong reviewer.`;
+
+const EMBED_ONLY_INSTRUCTIONS = `Fronts an embedding model, not a generative one. Two useful tools: local_llm_semantic_similarity ranks candidate texts by meaning against a query (cheap triage of a long candidate list before you read any of them), and local_llm_tokenize counts tokens with this model's tokenizer.
+
+There is deliberately no code generation, review, or explanation here -- an embedding backend has no chat-completion endpoint, so those tools are not registered. If this session also lists a differently-named local_llm server, that one fronts a generative model; send code-shaped work there.`;
 
 const MODEL_ARG_SCHEMA = {
   type: "string",
@@ -148,7 +165,7 @@ class LocalLlmServer {
         capabilities: {
           tools: {},
         },
-        instructions: SERVER_INSTRUCTIONS,
+        instructions: EMBED_ONLY ? EMBED_ONLY_INSTRUCTIONS : SERVER_INSTRUCTIONS,
       }
     );
 
@@ -436,13 +453,22 @@ class LocalLlmServer {
             required: ["query", "candidates"],
           },
         },
-      ],
+      ].filter((tool) => !EMBED_ONLY || EMBED_ONLY_TOOLS.has(tool.name)),
     }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
       try {
+        // A client holding a tool list from before the mode was set can still call a
+        // filtered-out tool. Say why it's gone, rather than letting it fail further in as
+        // a 404 on /v1/chat/completions or a missing-chat-template error.
+        if (EMBED_ONLY && !EMBED_ONLY_TOOLS.has(name)) {
+          throw new Error(
+            `${name} is unavailable: this server runs in embed-only mode (LOCAL_LLM_EMBED_ONLY), fronting an embedding model with no chat-completion endpoint. Available here: ${[...EMBED_ONLY_TOOLS].join(", ")}.`
+          );
+        }
+
         switch (name) {
           case "local_llm_generate_code":
             return await this.generateCode(args);
@@ -640,6 +666,21 @@ class LocalLlmServer {
       );
 
       const vectors = response.data?.data?.map((entry) => entry.embedding) ?? [];
+
+      // A backend can answer 200 with correctly-shaped vectors whose elements are all NaN,
+      // which JSON-serializes as null -- observed from llama-server fronting
+      // nomic-embed-text on a Vulkan build. cosineSimilarity over those returns NaN, and
+      // JSON.stringify would then report every score as `null`: a silently meaningless
+      // ranking that looks like a successful call. Fail loudly instead.
+      const badIndex = vectors.findIndex(
+        (vector) => !Array.isArray(vector) || vector.length === 0 || !vector.every(Number.isFinite)
+      );
+      if (badIndex !== -1) {
+        throw new Error(
+          `backend returned a non-numeric embedding for input ${badIndex} of ${vectors.length} (all-null/NaN vectors usually mean the model loaded but can't be run for embeddings on the server's current compute backend -- re-running that backend with -ngl 0 will confirm)`
+        );
+      }
+
       const [queryVector, ...candidateVectors] = vectors;
 
       const results = candidateVectors
@@ -811,6 +852,7 @@ class LocalLlmServer {
     const info = {
       base_url: LOCAL_LLM_BASE_URL,
       socket_path: LOCAL_LLM_SOCKET_PATH,
+      embed_only: EMBED_ONLY,
       model_id: model?.id ?? null,
       model_family: model?.id ? resolveFamily(model.id) : null,
       context_size: props?.default_generation_settings?.n_ctx ?? props?.n_ctx ?? null,
@@ -830,7 +872,9 @@ class LocalLlmServer {
       await this.server.close();
       process.exit(0);
     });
-    console.error(`local LLM MCP server running on stdio (target: ${LOCAL_LLM_BASE_URL})`);
+    console.error(
+      `local LLM MCP server running on stdio (target: ${LOCAL_LLM_BASE_URL}${EMBED_ONLY ? ", embed-only" : ""})`
+    );
   }
 }
 
