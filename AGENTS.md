@@ -7,7 +7,7 @@ repo. For user-facing docs see `README.md`; for manual validation see `TEST.md`.
 
 A Node.js MCP server (`index.js`) that bridges a local LLM server — Ollama (native API), or
 an OpenAI-compatible one such as `llama-server` (llama.cpp), vLLM, LM Studio — to
-MCP-speaking coding agents, exposing 15 `local_llm_*` tools. `llama-server` is the primary
+MCP-speaking coding agents, exposing 17 `local_llm_*` tools. `llama-server` is the primary
 worked example; the test suite mocks both llama-server and Ollama (see README's "Using
 Ollama" and "Using a Different Backend" sections). `prompts.js` holds the system/user prompt
 templates, indexed by tool and by detected model family.
@@ -33,7 +33,8 @@ for Ollama).
   calls (`CallToolRequestSchema`), resolves/caches the currently-loaded model
   (`resolveModel`, 30s TTL), and sends chat requests (`callLocalLlm` →
   `POST /v1/chat/completions`). File-aware tools (`review_file`, `explain_file`,
-  `analyze_files`, `generate_code_with_context`) read files server-side before calling
+  `analyze_files`, `generate_code_with_context`, `digest_file`, and `review_diff`, which runs
+  `git diff` itself) read their input server-side before calling
   `callLocalLlm`, which is the whole point of this project — it saves the orchestrating
   agent from having to paste file contents into its own context.
   Exports `LocalLlmServer` and only auto-starts (`server.run()`) when run directly (guarded
@@ -75,7 +76,21 @@ for Ollama).
   `ollamaServerInfo`. Context windows: `ollamaMaxContext` (`/api/show`, the model's maximum,
   known unloaded) and `ollamaRunningContext` (`/api/ps`, the actual window — Ollama caps
   `num_ctx` at the maximum), both best-effort/null on failure.
-  `getCodeGraphContext(query, cwd)` is a best-effort helper the four file-aware tools call:
+  **Thinking decisions.** With Ollama and no `TOOL_REASONING_OVERRIDES` entry, `callLocalLlm`
+  asks `decideThinking()` first: `resolveDecisionModel()` (`LOCAL_LLM_DECISION_MODEL`, "off",
+  or the first installed model with the `decision` capability, never auto-pulled) is sent
+  `decisionState()` (tool, `DECISION_TASKS[tool]` + the agent's instruction fields, code line
+  count; never the code) via `POST /v1/systemone`. Only a chat model with the `thinking`
+  capability is asked; only answers at probability >= `DECISION_MIN_PROBABILITY` (0.65) set
+  `think`; any failure returns undefined (model default). Counted in `this.thinkingDecisions`.
+  **`review_diff`** runs `git` via `execFileAsync` (no shell), only `diff`, with
+  `GIT_SAFE_CONFIG` + `GIT_DIFF_FLAGS` (no ext diff, no textconv, no fsmonitor), a `base`
+  checked against `SAFE_GIT_REF` (never starts with `-`; `git diff --output=` writes files) and
+  paths after `--`. `annotateDiff` labels lines with new-file line numbers from the hunk
+  headers. **`digest_file`**: `digestContent` strips ANSI codes, keeps the original line
+  numbers, and over `DIGEST_CHAR_BUDGET` (100k chars, prefixes counted) keeps 20% head / 80%
+  tail with an omitted-lines marker.
+  `getCodeGraphContext(query, cwd)` is a best-effort helper the file-aware tools call:
   if `cwd` (default `process.cwd()`) has a `.codegraph/` directory, it shells out to
   `codegraph explore <query>` (binary overridable via `CODEGRAPH_BIN`, mainly for tests) and
   folds the output into the prompt; any failure (no `.codegraph/`, missing binary, timeout)
@@ -97,7 +112,8 @@ for Ollama).
   one: per-call `model` arg, then `LOCAL_LLM_CHAT_MODEL` / `LOCAL_LLM_EMBEDDING_MODEL` (user
   configuration, read per call). Don't reintroduce a default/fallback model constant in code.
   With Ollama, `ensureOllamaModel` auto-pulls a configured model that isn't installed —
-  keep that limited to the env-configured names; a per-call `model` arg comes from the
+  keep that limited to the env-configured names (chat, embedding, decision); a per-call
+  `model` arg comes from the
   calling agent and must never trigger a download.
 - **File-aware tools take absolute paths** and read files inside the MCP server process —
   don't ask the orchestrating agent to paste file contents when a `*_file`/`*_files` tool
