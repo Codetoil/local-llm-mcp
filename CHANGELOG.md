@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- `scripts/ollama-patch-env.sh`: sets Ollama's server-side environment variables (e.g.
+  `OLLAMA_CONTEXT_LENGTH`) in the Homebrew launchd plist and reloads the service; a no-op when
+  they're already set. Described in the README's "Using Ollama" section.
+
+### Fixed
+- `ollama-patch-env.sh` took its `.bak` backup after editing the plist, so the backup held the
+  patched file. It now saves the original before any change and keeps it as `.bak` only when
+  something changed.
+
 ## Version 3.4.0 - Thinking decisions, review_diff, digest_file
 
 ### Features

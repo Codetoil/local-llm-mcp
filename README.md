@@ -209,6 +209,16 @@ probing `GET /api/version`, which OpenAI-compatible servers don't have. Set `LOC
 - **`local_llm_tokenize`** isn't available, since Ollama has no tokenize endpoint; it returns
   an error that says so.
 
+**Server-side settings with Homebrew (macOS).** Ollama's own settings, such as its default
+context window (`OLLAMA_CONTEXT_LENGTH`), are environment variables of the Ollama service,
+not of this MCP server. With `brew services`, they live in the service's launchd plist
+(`~/Library/LaunchAgents/sh.brew.ollama.plist`), and Homebrew regenerates that file on some
+service operations and upgrades. `scripts/ollama-patch-env.sh` writes the variables listed at
+its top into the plist and reloads the service, and does nothing when they're already set,
+so it's safe to re-run after an upgrade. Edit its `VARS` list first; it ships with
+`OLLAMA_KEEP_ALIVE=15m`, `OLLAMA_CONTEXT_LENGTH=131072`, `OLLAMA_FLASH_ATTENTION=1` and
+`OLLAMA_KV_CACHE_TYPE=q8_0`.
+
 ### Using a Different Backend (vLLM, LM Studio, etc.)
 
 This server has no llama.cpp-specific dependency in its request path — every tool talks to
@@ -617,7 +627,8 @@ local-llm-mcp/
 │   ├── server-unreachable.test.js
 │   └── integration.test.js
 ├── scripts/
-│   └── start-llama.sh    # Optional convenience launcher for llama-server (tmux + HF model lookup)
+│   ├── start-llama.sh    # Optional convenience launcher for llama-server (tmux + HF model lookup)
+│   └── ollama-patch-env.sh  # Sets Ollama's server env vars in its Homebrew launchd plist and reloads it
 ├── eslint.config.js      # ESLint flat config (recommended rules only, no style/formatting)
 ├── package.json          # Node.js dependencies
 ├── README.md             # This file
