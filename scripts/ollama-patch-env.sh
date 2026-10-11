@@ -16,6 +16,11 @@ OLLAMA_KV_CACHE_TYPE=q8_0
 
 [ -f "$PLIST" ] || { echo "Plist not found: $PLIST" >&2; exit 1; }
 
+# Save the original before touching it; it becomes $PLIST.bak only if something changes.
+backup=$(mktemp)
+cp "$PLIST" "$backup"
+trap 'echo "failed; the original plist is saved at $backup" >&2' ERR
+
 # Make sure the EnvironmentVariables dict exists
 $PB -c "Print :EnvironmentVariables" "$PLIST" >/dev/null 2>&1 \
   || $PB -c "Add :EnvironmentVariables dict" "$PLIST"
@@ -36,11 +41,12 @@ while IFS='=' read -r key value; do
 done <<< "$VARS"
 
 if [ "$changed" = 1 ]; then
-  cp "$PLIST" "$PLIST.bak"
+  mv "$backup" "$PLIST.bak"
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   launchctl bootstrap "$DOMAIN" "$PLIST"
   echo "service reloaded"
 else
+  rm -f "$backup"
   echo "plist already up to date"
 fi
 
